@@ -31,6 +31,9 @@ jobs:
 
   lint:
     name: Validate Workflow
+    if: |
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'type/task')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'type/task'))
     if: |`n      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'type/task')) ||`n      (github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'type/task'))`n    uses: ./.github/workflows/yaml-lint.yml
     with:
       files: ".github/workflows/task-triage.yml"
