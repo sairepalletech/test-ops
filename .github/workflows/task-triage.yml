@@ -31,7 +31,7 @@ jobs:
 
   lint:
     name: Validate Workflow
-    uses: ./.github/workflows/yaml-lint.yml
+    if: |`n      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'type/task')) ||`n      (github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'type/task'))`n    uses: ./.github/workflows/yaml-lint.yml
     with:
       files: ".github/workflows/task-triage.yml"
 
@@ -703,3 +703,4 @@ jobs:
                 } catch (e) { core.warning(`Could not post on #${depNumber}`); }
               }
             }
+
