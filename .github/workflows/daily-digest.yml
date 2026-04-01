@@ -1,0 +1,389 @@
+name: Daily Digest
+
+on:
+  schedule:
+    - cron: "0 6 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — generate CSVs but do not apply labels"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  issues: write
+  contents: read
+  actions: write
+
+concurrency:
+  group: daily-digest
+  cancel-in-progress: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLA clock design:
+#
+#   Critical issues:  clock starts at issue created_at (never enters backlog)
+#   All others:       clock starts at the `in-progress` lifecycle timestamp
+#                     embedded by task-triage.yml when /start is posted.
+#                     Falls back to updated_at ONLY for issues created before
+#                     this system was deployed (no lifecycle timestamps present).
+#
+#   Clock pauses when `sla-paused` timestamp is present and no `sla-resumed`
+#   follows. Handled by lifecycle-timestamps.js --action elapsed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+
+  lint:
+    name: Validate Workflow
+    uses: ./.github/workflows/yaml-lint.yml
+    with:
+      files: ".github/workflows/daily-digest.yml"
+
+  generate-digest:
+    name: Generate Daily Digest and Enforce SLA
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate CSVs and enforce SLA
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const ws = process.env.GITHUB_WORKSPACE;
+            const dryRun = '${{ inputs.dry_run }}' === 'true';
+            const today = new Date();
+            const todayStr = today.toISOString().split('T')[0];
+
+            const slaConfig = {
+              'priority/critical': { days: 1,  calendar: true  },
+              'priority/high':     { days: 3,  calendar: false },
+              'priority/medium':   { days: 7,  calendar: false },
+              'priority/low':      { days: 14, calendar: false }
+            };
+
+            function businessDaysBetween(startDate, endDate) {
+              let count = 0;
+              const current = new Date(startDate);
+              while (current < endDate) {
+                const day = current.getDay();
+                if (day !== 0 && day !== 6) count++;
+                current.setDate(current.getDate() + 1);
+              }
+              return count;
+            }
+
+            function calendarDaysBetween(startDate, endDate) {
+              return Math.max(0, Math.floor((endDate - startDate) / (1000 * 60 * 60 * 24)));
+            }
+
+            core.info(`Running daily digest for ${todayStr} (dry_run=${dryRun})`);
+
+            const allIssues = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100
+              }
+            );
+
+            const closedToday = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'closed',
+                since: new Date(todayStr + 'T00:00:00Z').toISOString(),
+                per_page: 100
+              }
+            );
+
+            const closedTodayCount = closedToday.filter(i => {
+              if (!i.closed_at) return false;
+              return new Date(i.closed_at).toISOString().split('T')[0] === todayStr;
+            }).length;
+
+            const fullRows = [];
+            let inProgressCount = 0, blockedCount = 0, validationCount = 0;
+            let slaBreachedCount = 0, newTodayCount = 0;
+
+            for (const issue of allIssues) {
+              if (issue.pull_request) continue;
+
+              const labels = issue.labels.map(l => l.name);
+              const createdAt = new Date(issue.created_at);
+              const updatedAt = new Date(issue.updated_at); // kept as last-resort fallback only
+
+              const typeLabel     = labels.find(l => l.startsWith('type/'))     || 'unknown';
+              const verticalLabel = labels.find(l => l.startsWith('vertical/')) || 'unknown';
+              const priorityLabel = labels.find(l => l.startsWith('priority/')) || null;
+              const statusLabel   = labels.find(l => l.startsWith('status/'))   || 'unknown';
+              const assignee      = issue.assignees.length > 0
+                ? issue.assignees.map(a => a.login).join('; ')
+                : 'unassigned';
+
+              // Epic parent via parse-issue-body.js
+              let epicParent = 'none';
+              try {
+                const body = (issue.body || '').replace(/'/g, "'\\''");
+                const parsed = execSync(
+                  `node .github/scripts/parse-issue-body.js --all --body '${body}'`,
+                  { encoding: 'utf-8', cwd: ws }
+                );
+                const fields = JSON.parse(parsed);
+                if (fields._epic_number) epicParent = String(fields._epic_number);
+              } catch (e) {
+                // Fallback: inline parse for pre-existing issues
+                const m = (issue.body || '').match(/###\s*Parent Epic Number\s*\n+([\s\S]+?)(?=\n###|$)/);
+                if (m) epicParent = m[1].trim().replace(/[^0-9]/g, '') || 'none';
+              }
+
+              const daysOpen    = calendarDaysBetween(createdAt, today);
+              const hasDep      = labels.includes('has-dependency');
+              const isInProgress = labels.includes('status/in-progress');
+              const isBlocked    = labels.includes('status/blocked');
+              const isCritical   = priorityLabel === 'priority/critical';
+
+              // ── Real SLA clock start via lifecycle-timestamps.js ──────────
+              let clockStartDate = null;
+              let slaIsPaused = false;
+              let effectiveElapsed = null;
+
+              if (priorityLabel && slaConfig[priorityLabel]) {
+                if (isCritical) {
+                  // Critical: clock starts at creation, no /start needed
+                  clockStartDate = createdAt;
+                  const config = slaConfig[priorityLabel];
+                  const elapsed = calendarDaysBetween(createdAt, today);
+                  effectiveElapsed = elapsed;
+                } else if (isInProgress || isBlocked) {
+                  // Non-critical: read real in-progress timestamp from comments
+                  try {
+                    const comments = await github.paginate(
+                      github.rest.issues.listComments, {
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: issue.number,
+                        per_page: 100
+                      }
+                    );
+
+                    const commentsJson = JSON.stringify(
+                      comments.map(c => ({ id: c.id, body: c.body, created_at: c.created_at }))
+                    ).replace(/'/g, "'\\''");
+
+                    // Get elapsed time using lifecycle-timestamps.js --action elapsed
+                    // This handles pause/resume automatically
+                    const elapsedJson = execSync(
+                      `node .github/scripts/lifecycle-timestamps.js --action elapsed --event in-progress --today ${todayStr} --comments '${commentsJson}'`,
+                      { encoding: 'utf-8', cwd: ws }
+                    );
+                    const elapsedData = JSON.parse(elapsedJson);
+
+                    if (elapsedData.started_at) {
+                      clockStartDate = new Date(elapsedData.started_at);
+                      slaIsPaused    = elapsedData.currently_paused || false;
+                      const config   = slaConfig[priorityLabel];
+                      effectiveElapsed = config.calendar
+                        ? elapsedData.effective_days
+                        : elapsedData.effective_business_days;
+                    } else {
+                      // No lifecycle timestamp found — fall back to updated_at with a warning
+                      core.warning(`#${issue.number}: no in-progress timestamp found — falling back to updated_at for SLA clock`);
+                      clockStartDate = updatedAt;
+                      const config = slaConfig[priorityLabel];
+                      effectiveElapsed = config.calendar
+                        ? calendarDaysBetween(updatedAt, today)
+                        : businessDaysBetween(updatedAt, today);
+                    }
+                  } catch (e) {
+                    core.warning(`#${issue.number}: lifecycle-timestamps error — ${e.message} — falling back to updated_at`);
+                    clockStartDate = updatedAt;
+                    const config = slaConfig[priorityLabel];
+                    effectiveElapsed = config.calendar
+                      ? calendarDaysBetween(updatedAt, today)
+                      : businessDaysBetween(updatedAt, today);
+                  }
+                }
+              }
+
+              // ── SLA breach determination ───────────────────────────────────
+              let slaBreached = false;
+              let daysUntilBreach = 'N/A';
+
+              if (priorityLabel && slaConfig[priorityLabel] && effectiveElapsed !== null && !slaIsPaused) {
+                const threshold = slaConfig[priorityLabel].days;
+                daysUntilBreach = threshold - effectiveElapsed;
+                if ((isInProgress || isCritical) && effectiveElapsed > threshold) {
+                  slaBreached = true;
+                }
+              }
+
+              // ── Apply / remove status/overdue label ───────────────────────
+              const alreadyOverdue = labels.includes('status/overdue');
+              if (slaBreached && !alreadyOverdue && !dryRun) {
+                try {
+                  await github.rest.issues.addLabels({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    issue_number: issue.number, labels: ['status/overdue']
+                  });
+                  core.info(`Applied status/overdue to #${issue.number} (${effectiveElapsed} effective days)`);
+                } catch (e) {
+                  core.warning(`Could not apply overdue to #${issue.number}: ${e.message}`);
+                }
+              }
+              if (!slaBreached && alreadyOverdue && !dryRun) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    issue_number: issue.number, name: 'status/overdue'
+                  });
+                  core.info(`Removed stale status/overdue from #${issue.number}`);
+                } catch (e) { /* ignore */ }
+              }
+
+              // ── Days in current status — from last status transition ───────
+              // Use lifecycle-timestamps to find when current status was entered
+              let daysInStatus = calendarDaysBetween(updatedAt, today); // fallback
+              const statusEventMap = {
+                'status/review':            'review',
+                'status/backlog':           'backlog',
+                'status/sprint':            'sprint',
+                'status/in-progress':       'in-progress',
+                'status/blocked':           'blocked',
+                'status/validation':        'validation',
+                'status/feedback-required': 'feedback-required',
+                'status/done':              'done',
+              };
+              const currentStatusEvent = statusEventMap[statusLabel];
+              if (currentStatusEvent && clockStartDate !== null) {
+                // For in-progress we already have elapsed — reuse it
+                if (currentStatusEvent === 'in-progress' && effectiveElapsed !== null) {
+                  daysInStatus = effectiveElapsed;
+                }
+              }
+
+              // Counters
+              if (isInProgress)                            inProgressCount++;
+              if (isBlocked)                               blockedCount++;
+              if (labels.includes('status/validation'))    validationCount++;
+              if (slaBreached || alreadyOverdue)           slaBreachedCount++;
+              if (createdAt.toISOString().split('T')[0] === todayStr) newTodayCount++;
+
+              fullRows.push({
+                issue_number:           issue.number,
+                title:                  `"${(issue.title || '').replace(/"/g, '""')}"`,
+                type:                   typeLabel.replace('type/', ''),
+                vertical:               verticalLabel.replace('vertical/', ''),
+                assignee,
+                priority:               (priorityLabel || 'none').replace('priority/', ''),
+                status:                 statusLabel.replace('status/', ''),
+                epic_parent:            epicParent,
+                date_opened:            createdAt.toISOString().split('T')[0],
+                days_open:              daysOpen,
+                days_in_current_status: daysInStatus,
+                sla_clock_start:        clockStartDate ? clockStartDate.toISOString().split('T')[0] : 'unknown',
+                sla_paused:             slaIsPaused,
+                sla_breached:           slaBreached,
+                days_until_breach:      typeof daysUntilBreach === 'number' ? daysUntilBreach : 'N/A',
+                blocked:                isBlocked,
+                has_dependency:         hasDep,
+                url:                    issue.html_url
+              });
+            }
+
+            if (fullRows.length === 0) {
+              core.info('No open issues — skipping artifact upload');
+              return;
+            }
+
+            // Sort oldest first
+            fullRows.sort((a, b) => b.days_open - a.days_open);
+
+            // Sprint health
+            const sprintIssues = fullRows.filter(r =>
+              ['sprint', 'in-progress'].includes(r.status)
+            );
+            const sprintHealth = sprintIssues.length > 0
+              ? Math.round((sprintIssues.filter(r => !r.sla_breached).length / sprintIssues.length) * 100)
+              : 100;
+
+            // Write CSVs
+            const fs = require('fs');
+            const fullHeaders = Object.keys(fullRows[0]).join(',');
+            const fullCsv = [fullHeaders, ...fullRows.map(r => Object.values(r).join(','))].join('\n');
+
+            const summaryRows = [
+              ['metric', 'count'],
+              ['report_date', todayStr],
+              ['new_today', newTodayCount],
+              ['in_progress', inProgressCount],
+              ['blocked', blockedCount],
+              ['awaiting_validation', validationCount],
+              ['closed_today', closedTodayCount],
+              ['sla_breached', slaBreachedCount],
+              ['sprint_health_percent', sprintHealth],
+              ['total_open', fullRows.length]
+            ];
+            const summaryCsv = summaryRows.map(r => r.join(',')).join('\n');
+
+            fs.writeFileSync('/tmp/full-detail.csv', fullCsv, 'utf8');
+            fs.writeFileSync('/tmp/summary.csv', summaryCsv, 'utf8');
+
+            core.info(`Digest complete: ${fullRows.length} issues, ${slaBreachedCount} breached, sprint health ${sprintHealth}%`);
+
+
+      - name: Notify on digest failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Open a maintenance issue when the digest fails
+            const today = new Date().toISOString().split('T')[0];
+            try {
+              const existing = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: 'standup-digest',
+                state: 'open',
+                per_page: 1
+              });
+              const targetNumber = existing.data[0]?.number;
+              if (targetNumber) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: targetNumber,
+                  body: [
+                    `## ⚠️ Daily Digest Failed — ${today}`,
+                    '',
+                    'The daily-digest workflow failed. SLA calculations and CSV artifacts were NOT generated.',
+                    '',
+                    `**Action required:** Check the [workflow run](https://github.com/` +
+                      context.repo.owner + '/' + context.repo.repo +
+                      '/actions/workflows/daily-digest.yml) for details.',
+                    '',
+                    'Run `daily-digest.yml` manually via workflow_dispatch to retry.',
+                    '',
+                    '---',
+                    '*Automated by CI/CD IssueOps | ci-cd-team*'
+                  ].join('\n')
+                });
+              }
+            } catch (e) {
+              core.warning(`Could not post failure notification: ${e.message}`);
+            }
+
+      - name: Upload digest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cicd-daily-digest-${{ github.run_id }}
+          path: |
+            /tmp/full-detail.csv
+            /tmp/summary.csv
+          retention-days: 30
+          if-no-files-found: warn

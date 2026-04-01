@@ -1,0 +1,25 @@
+# CI/CD Team Pod Owner Routing
+# This file drives both PR review assignment and IssueOps triage routing.
+# One edit here updates all downstream behavior — PR reviews and issue routing.
+# Format: path  @github-handle
+#
+# To update a pod owner:
+#   1. Replace the @handle below
+#   2. Commit to main
+#   3. All subsequent triage routing updates automatically
+
+# ── Vertical Pod Owners ─────────────────────────────────────────────────────
+.github/verticals/datadog/           @pod-owner-datadog
+.github/verticals/artifactory/       @pod-owner-artifactory
+.github/verticals/github-platform/   @pod-owner-github
+.github/verticals/jira-wiki/         @pod-owner-jira
+.github/verticals/tfe/               @pod-owner-tfe
+.github/verticals/gitlab-pipelines/  @pod-owner-gitlab
+
+# ── Workflow Files — Team Lead Review Required ───────────────────────────────
+.github/workflows/                   @team-lead
+.github/ISSUE_TEMPLATE/              @team-lead
+.github/copilot/                     @team-lead
+
+# ── Default Ownership ────────────────────────────────────────────────────────
+*                                    @team-lead

@@ -1,0 +1,387 @@
+name: Epic Triage
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: epic-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ─── Lint gate — runs first on every trigger ──────────────────────────────
+  lint:
+    name: Validate Workflow
+    uses: ./.github/workflows/yaml-lint.yml
+    with:
+      files: ".github/workflows/epic-triage.yml"
+
+  # ─── Handle new Epic opened ───────────────────────────────────────────────
+  on-epic-opened:
+    name: Handle Epic Opened
+    needs: lint
+    if: |
+      github.event_name == 'issues' &&
+      github.event.action == 'opened' &&
+      contains(github.event.issue.labels.*.name, 'type/epic')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post pending approval comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+
+            // Parse vertical from issue body for routing info
+            const verticalMap = {
+              'Datadog': 'vertical/datadog',
+              'Artifactory': 'vertical/artifactory',
+              'GitHub Platform': 'vertical/github-platform',
+              'JIRA & Wiki': 'vertical/jira-wiki',
+              'TFE': 'vertical/tfe',
+              'GitLab Pipelines': 'vertical/gitlab-pipelines',
+              'Cross-vertical': 'vertical/cross'
+            };
+
+            let detectedVertical = 'Not yet determined';
+            for (const [key] of Object.entries(verticalMap)) {
+              if (body.includes(key)) {
+                detectedVertical = key;
+                break;
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: [
+                '## 📋 Epic Received — Pending Approval',
+                '',
+                'This Epic is in **pending approval** status. No tasks can be linked to it until it is approved.',
+                '',
+                '| Field | Value |',
+                '|-------|-------|',
+                `| **Vertical detected** | ${detectedVertical} |`,
+                `| **Submitted by** | @${issue.user.login} |`,
+                `| **Submitted at** | ${new Date().toISOString().split('T')[0]} |`,
+                '',
+                '### Actions available to maintainers with write access',
+                '',
+                '| Command | Effect |',
+                '|---------|--------|',
+                '| `/approve` | Activates the Epic — applies all labels, generates Epic ID, moves to backlog |',
+                '| `/reject <reason>` | Closes the Epic with the reason documented |',
+                '',
+                '> ⚠️ Only maintainers with write access to this repository can approve or reject.',
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });
+
+
+      - name: Notify on workflow failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const num = context.issue?.number || context.payload?.issue?.number;
+            if (num) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: num,
+                body: '## ⚠️ Epic Triage Workflow Failed\n\nThe epic-triage workflow failed during processing. The Epic may not have been correctly processed.\n\nCheck the [workflow run](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions/workflows/epic-triage.yml) for details.\n\n---\n*Automated by CI/CD IssueOps | ci-cd-team*'
+              });
+            }
+
+  # ─── Handle /approve command ─────────────────────────────────────────────
+  on-approve:
+    name: Handle Approve Command
+    needs: lint
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      startsWith(github.event.comment.body, '/approve') &&
+      contains(github.event.issue.labels.*.name, 'type/epic')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check commenter write access
+        id: check-access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor
+            });
+            const allowed = ['admin', 'write'].includes(perm.permission);
+            core.setOutput('authorized', allowed.toString());
+            if (!allowed) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: [
+                  `## ❌ Unauthorized`,
+                  '',
+                  `@${context.actor} — you do not have write access to approve Epics.`,
+                  'Only repository maintainers can approve or reject Epics.',
+                  '',
+                  '---',
+                  '*Automated by CI/CD IssueOps | ci-cd-team*'
+                ].join('\n')
+              });
+            }
+
+      - name: Apply approval labels and generate Epic ID
+        if: steps.check-access.outputs.authorized == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const body = issue.data.body || '';
+            const issueNumber = context.issue.number;
+            const year = new Date().getFullYear();
+            const epicId = `EPIC-${year}-${String(issueNumber).padStart(3, '0')}`;
+            const today = new Date().toISOString().split('T')[0];
+
+            // Vertical mapping
+            const verticalMap = {
+              'Datadog': 'vertical/datadog',
+              'Artifactory': 'vertical/artifactory',
+              'GitHub Platform': 'vertical/github-platform',
+              'JIRA & Wiki': 'vertical/jira-wiki',
+              'TFE': 'vertical/tfe',
+              'GitLab Pipelines': 'vertical/gitlab-pipelines',
+              'Cross-vertical': 'vertical/cross'
+            };
+
+            // Priority mapping
+            const priorityMap = {
+              'Critical': 'priority/critical',
+              'High': 'priority/high',
+              'Medium': 'priority/medium',
+              'Low': 'priority/low'
+            };
+
+            let verticalLabel = 'vertical/cross';
+            let detectedVertical = 'Cross-vertical';
+            for (const [key, val] of Object.entries(verticalMap)) {
+              if (body.includes(key)) {
+                verticalLabel = val;
+                detectedVertical = key;
+                break;
+              }
+            }
+
+            let priorityLabel = 'priority/medium';
+            let detectedPriority = 'Medium';
+            for (const [key, val] of Object.entries(priorityMap)) {
+              if (body.includes(key)) {
+                priorityLabel = val;
+                detectedPriority = key;
+                break;
+              }
+            }
+
+            // Remove pending-approval label
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                name: 'status/pending-approval'
+              });
+            } catch (e) {
+              core.info('status/pending-approval label not present or already removed');
+            }
+
+            // Apply all approval labels
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: [
+                'epic',
+                'OKR',
+                String(year),
+                'status/backlog',
+                verticalLabel,
+                priorityLabel
+              ]
+            });
+
+            // Post approval confirmation
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: [
+                '## ✅ Epic Approved',
+                '',
+                '| Field | Value |',
+                '|-------|-------|',
+                `| **Epic ID** | \`${epicId}\` |`,
+                `| **Approved by** | @${context.actor} |`,
+                `| **Approved on** | ${today} |`,
+                `| **Vertical** | ${detectedVertical} |`,
+                `| **Priority** | ${detectedPriority} |`,
+                `| **Status** | Moved to backlog |`,
+                '',
+                `This Epic is now **active**. Tasks can be created and linked using \`#${issueNumber}\` as the Parent Epic Number.`,
+                '',
+                '### Labels applied',
+                `\`epic\` \`OKR\` \`${year}\` \`status/backlog\` \`${verticalLabel}\` \`${priorityLabel}\``,
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });
+
+            // Release any tasks that were blocked pending this Epic
+            const blockedTasks = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: 'status/blocked-pending-epic',
+                state: 'open',
+                per_page: 100
+              }
+            );
+
+            let releasedCount = 0;
+            for (const blockedIssue of blockedTasks) {
+              const refPattern = new RegExp(`#${issueNumber}\\b`);
+              if (blockedIssue.body && refPattern.test(blockedIssue.body)) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: blockedIssue.number,
+                    name: 'status/blocked-pending-epic'
+                  });
+                } catch (e) {
+                  core.info(`Could not remove blocked label from #${blockedIssue.number}`);
+                }
+
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: blockedIssue.number,
+                  labels: ['status/review']
+                });
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: blockedIssue.number,
+                  body: [
+                    '## 🔓 Task Released',
+                    '',
+                    `Parent Epic #${issueNumber} (\`${epicId}\`) has been approved.`,
+                    'This task has been moved to **status/review** and is ready for pod owner triage.',
+                    '',
+                    '---',
+                    '*Automated by CI/CD IssueOps | ci-cd-team*'
+                  ].join('\n')
+                });
+                releasedCount++;
+              }
+            }
+
+            if (releasedCount > 0) {
+              core.info(`Released ${releasedCount} tasks that were blocked pending this Epic`);
+            }
+
+  # ─── Handle /reject command ──────────────────────────────────────────────
+  on-reject:
+    name: Handle Reject Command
+    needs: lint
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      startsWith(github.event.comment.body, '/reject') &&
+      contains(github.event.issue.labels.*.name, 'type/epic')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check commenter write access
+        id: check-access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor
+            });
+            const allowed = ['admin', 'write'].includes(perm.permission);
+            core.setOutput('authorized', allowed.toString());
+
+      - name: Reject Epic
+        if: steps.check-access.outputs.authorized == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commentBody = context.payload.comment.body;
+            const reason = commentBody.replace('/reject', '').trim() || 'No reason provided';
+            const today = new Date().toISOString().split('T')[0];
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## ❌ Epic Rejected',
+                '',
+                '| Field | Value |',
+                '|-------|-------|',
+                `| **Reason** | ${reason} |`,
+                `| **Rejected by** | @${context.actor} |`,
+                `| **Date** | ${today} |`,
+                '',
+                'This Epic has been closed. If the concerns are addressed, a new Epic can be submitted.',
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });
+
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: 'closed',
+              state_reason: 'not_planned'
+            });
+
+      - name: Deny unauthorized reject
+        if: steps.check-access.outputs.authorized == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                `@${context.actor} — you do not have write access to reject Epics.`,
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });

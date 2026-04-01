@@ -1,0 +1,105 @@
+name: Bug Report
+description: Something is broken — for production incidents use priority Critical
+title: "[BUG] "
+labels: ["type/bug", "status/review"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Bug Report
+        Use this for broken pipelines, failed artifacts, runner issues, or any CI/CD malfunction.
+        For **production-down** scenarios set Priority to Critical — the workflow will bypass the backlog.
+
+  - type: input
+    id: bug_title
+    attributes:
+      label: Bug Title
+      description: Short description of what is broken
+      placeholder: e.g. Artifactory Docker push failing with 401 on prod pipeline
+    validations:
+      required: true
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What is happening?
+      description: Describe the broken behavior — what do you see
+      placeholder: Describe exactly what is going wrong
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should happen?
+      description: Describe the expected behavior
+      placeholder: Describe what should happen instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can the team reproduce this issue
+      placeholder: |
+        1. Trigger pipeline X
+        2. See error at step Y
+        3. Error message: ...
+    validations:
+      required: true
+
+  - type: input
+    id: epic_ref
+    attributes:
+      label: Parent Epic Number
+      description: Link to an Epic if this bug is part of a larger initiative — leave blank for standalone bugs
+      placeholder: e.g. #10 (optional)
+    validations:
+      required: false
+
+  - type: dropdown
+    id: vertical
+    attributes:
+      label: Vertical
+      description: Which CI/CD tool is affected
+      options:
+        - Datadog
+        - Artifactory
+        - GitHub Platform
+        - JIRA & Wiki
+        - TFE
+        - GitLab Pipelines
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority / Urgency
+      description: "Critical: production down | High: significant impact | Medium: workaround exists | Low: minor"
+      options:
+        - Critical
+        - High
+        - Medium
+        - Low
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: Affected System
+      description: Repo, pipeline, environment, or tool
+      placeholder: e.g. cicd-pipelines / prod / github-runner-fleet
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or error output
+      description: Paste any relevant logs, error messages, or stack traces
+      render: shell
+    validations:
+      required: false

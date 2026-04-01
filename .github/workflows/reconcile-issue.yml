@@ -1,0 +1,341 @@
+name: Reconcile Issue State
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to reconcile"
+        required: true
+        type: number
+      force_status:
+        description: "Force a specific status label (leave blank to auto-detect)"
+        required: false
+        type: choice
+        options:
+          - ""
+          - status/review
+          - status/backlog
+          - status/sprint
+          - status/in-progress
+          - status/blocked
+          - status/validation
+          - status/done
+      dry_run:
+        description: "Dry run — report only, do not apply changes"
+        required: false
+        default: "true"
+        type: boolean
+
+permissions:
+  issues: write
+  contents: read
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Drift classes detected by this workflow:
+#
+#   Class 1: Status label inconsistent with last lifecycle timestamp
+#   Class 2: status/blocked present with no /block comment found
+#   Class 3: status/validation present with no prior status/in-progress timestamp
+#   Class 4: Issue closed but still labelled status/blocked or status/in-progress
+#   Class 5: status/critical label without fast-lane comment
+#   Class 6: Multiple mutually exclusive status/* labels applied simultaneously
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+
+  lint:
+    name: Validate Workflow
+    uses: ./.github/workflows/yaml-lint.yml
+    with:
+      files: ".github/workflows/reconcile-issue.yml"
+
+  reconcile:
+    name: Detect and Repair Drift
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run drift detection
+        id: detect
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const ws = process.env.GITHUB_WORKSPACE;
+            const issueNumber = ${{ github.event.inputs.issue_number }};
+            const forceStatus = '${{ github.event.inputs.force_status }}';
+            const dryRun = '${{ github.event.inputs.dry_run }}' !== 'false';
+            const today = new Date().toISOString().split('T')[0];
+
+            core.info(`Reconciling #${issueNumber} dry_run=${dryRun}`);
+
+            // ── Fetch issue ────────────────────────────────────────────────
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+
+            const currentLabels = issue.labels.map(l => l.name);
+            const statusLabels = currentLabels.filter(l => l.startsWith('status/'));
+            const isClosed = issue.state === 'closed';
+
+            // ── Fetch all comments ─────────────────────────────────────────
+            const comments = await github.paginate(
+              github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                per_page: 100
+              }
+            );
+
+            const commentsJson = JSON.stringify(
+              comments.map(c => ({ id: c.id, body: c.body, created_at: c.created_at }))
+            );
+
+            // ── Get lifecycle history via script ───────────────────────────
+            let history = [];
+            try {
+              const histRaw = execSync(
+                `node .github/scripts/lifecycle-timestamps.js --action history --comments '${commentsJson.replace(/'/g, "'\\''")}'`,
+                { encoding: 'utf-8', cwd: ws }
+              );
+              history = JSON.parse(histRaw);
+            } catch (e) {
+              core.warning(`lifecycle-timestamps failed: ${e.message}`);
+            }
+
+            const lastEvent = history.length > 0 ? history[history.length - 1] : null;
+            const eventToStatus = {
+              'review': 'status/review',
+              'backlog': 'status/backlog',
+              'sprint': 'status/sprint',
+              'in-progress': 'status/in-progress',
+              'unblocked': 'status/in-progress',
+              'blocked': 'status/blocked',
+              'validation': 'status/validation',
+              'feedback-required': 'status/feedback-required',
+              'done': 'status/done',
+            };
+            const historyDerivedStatus = lastEvent ? (eventToStatus[lastEvent.event] || null) : null;
+            const currentStatus = statusLabels[0] || 'none';
+
+            // ── Check for IssueOps command comments ───────────────────────
+            const commandComments = comments.filter(c => /^\/(block|unblock|start|validate|accept|approve)/.test(c.body.trim()));
+            const hasBlockComment = comments.some(c => c.body.trim().startsWith('/block'));
+            const hasStartComment = comments.some(c => c.body.trim().startsWith('/start'));
+            const hasValidateComment = comments.some(c => c.body.trim().startsWith('/validate'));
+            const hasFastLaneComment = comments.some(c =>
+              c.body.includes('Critical Issue') && c.body.includes('Fast Lane Activated')
+            );
+
+            // ══════════════════════════════════════════════════════════════
+            // DRIFT DETECTION — 6 classes
+            // ══════════════════════════════════════════════════════════════
+
+            const drifts = [];
+
+            // Class 1: Status label inconsistent with last lifecycle timestamp
+            if (historyDerivedStatus && currentStatus !== historyDerivedStatus && !isClosed) {
+              drifts.push({
+                class: 1,
+                severity: 'HIGH',
+                description: `Status label \`${currentStatus}\` does not match last lifecycle event (\`${lastEvent.event}\` → expected \`${historyDerivedStatus}\`)`,
+                recommended_fix: `Apply \`${historyDerivedStatus}\`, remove \`${currentStatus}\``,
+                auto_fixable: true,
+                target_status: historyDerivedStatus
+              });
+            }
+
+            // Class 2: status/blocked present with no /block comment
+            if (currentLabels.includes('status/blocked') && !hasBlockComment) {
+              drifts.push({
+                class: 2,
+                severity: 'MEDIUM',
+                description: '`status/blocked` label present but no `/block` command comment found — label may have been applied manually',
+                recommended_fix: 'Remove `status/blocked` if not intentional, or post `/block <reason>` to properly document the blocker',
+                auto_fixable: false
+              });
+            }
+
+            // Class 3: status/validation present with no prior in-progress timestamp
+            if (currentLabels.includes('status/validation')) {
+              const hasInProgressTs = history.some(t => t.event === 'in-progress');
+              if (!hasInProgressTs && !hasStartComment) {
+                drifts.push({
+                  class: 3,
+                  severity: 'LOW',
+                  description: '`status/validation` present but no prior `in-progress` lifecycle timestamp found — issue may have skipped the /start → /validate path',
+                  recommended_fix: 'No action required if validation is legitimate. If suspicious, check comment history manually.',
+                  auto_fixable: false
+                });
+              }
+            }
+
+            // Class 4: Issue closed but still labelled status/blocked or status/in-progress
+            if (isClosed) {
+              const activeLabels = ['status/blocked', 'status/in-progress', 'status/validation', 'status/sprint'];
+              const stuckLabels = activeLabels.filter(l => currentLabels.includes(l));
+              if (stuckLabels.length > 0) {
+                drifts.push({
+                  class: 4,
+                  severity: 'MEDIUM',
+                  description: `Issue is closed but still has active status label(s): \`${stuckLabels.join('`, `')}\``,
+                  recommended_fix: `Remove \`${stuckLabels.join('`, `')}\` — issue is closed, these labels are stale`,
+                  auto_fixable: true,
+                  labels_to_remove: stuckLabels
+                });
+              }
+            }
+
+            // Class 5: priority/critical label without fast-lane comment
+            if (currentLabels.includes('priority/critical') && !hasFastLaneComment && !isClosed) {
+              drifts.push({
+                class: 5,
+                severity: 'LOW',
+                description: '`priority/critical` label present but no fast-lane activation comment found — critical-fast-lane.yml may have failed to fire',
+                recommended_fix: 'Run `critical-fast-lane.yml` manually, or add `status/sprint` label if issue should be in the sprint',
+                auto_fixable: false
+              });
+            }
+
+            // Class 6: Multiple mutually exclusive status/* labels
+            const mutuallyExclusive = [
+              'status/review', 'status/backlog', 'status/sprint',
+              'status/in-progress', 'status/blocked', 'status/validation',
+              'status/feedback-required', 'status/done'
+            ];
+            const conflicting = statusLabels.filter(l => mutuallyExclusive.includes(l));
+            if (conflicting.length > 1) {
+              drifts.push({
+                class: 6,
+                severity: 'HIGH',
+                description: `Multiple mutually exclusive status labels applied: \`${conflicting.join('`, `')}\``,
+                recommended_fix: `Keep only \`${historyDerivedStatus || conflicting[conflicting.length - 1]}\`, remove the others`,
+                auto_fixable: true,
+                target_status: historyDerivedStatus || conflicting[conflicting.length - 1],
+                labels_to_remove: conflicting.filter(l => l !== (historyDerivedStatus || conflicting[conflicting.length - 1]))
+              });
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            // BUILD REPORT
+            // ══════════════════════════════════════════════════════════════
+            const targetStatus = forceStatus || (drifts.find(d => d.auto_fixable && d.target_status)?.target_status);
+
+            const reportLines = [
+              `## 🔧 Issue State Reconciliation — #${issueNumber}`,
+              '',
+              '| Field | Value |',
+              '|-------|-------|',
+              `| **Issue** | #${issueNumber} — ${issue.title.substring(0, 60)} |`,
+              `| **State** | ${isClosed ? 'Closed' : 'Open'} |`,
+              `| **Current status labels** | ${statusLabels.join(', ') || 'none'} |`,
+              `| **History-derived status** | ${historyDerivedStatus || 'unknown (no timestamps found)'} |`,
+              `| **Last lifecycle event** | ${lastEvent ? `\`${lastEvent.event}\` at ${lastEvent.ts}` : 'none'} |`,
+              `| **Dry run** | ${dryRun} |`,
+              '',
+            ];
+
+            if (drifts.length === 0) {
+              reportLines.push('### ✅ No drift detected — labels are consistent with history');
+            } else {
+              reportLines.push(`### ⚠️ ${drifts.length} drift class(es) detected`);
+              reportLines.push('');
+              for (const drift of drifts) {
+                reportLines.push(
+                  `#### Class ${drift.class} — ${drift.severity}`,
+                  `**Issue:** ${drift.description}`,
+                  `**Recommended fix:** ${drift.recommended_fix}`,
+                  `**Auto-fixable:** ${drift.auto_fixable ? 'Yes' : 'No — manual action required'}`,
+                  ''
+                );
+              }
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            // APPLY FIXES (if not dry run and auto-fixable drifts exist)
+            // ══════════════════════════════════════════════════════════════
+            const autoFixable = drifts.filter(d => d.auto_fixable);
+
+            if (!dryRun && autoFixable.length > 0) {
+              reportLines.push('### 🔨 Applying auto-fixes');
+
+              for (const drift of autoFixable) {
+                // Remove incorrect labels
+                const toRemove = drift.labels_to_remove || statusLabels.filter(l => l !== drift.target_status);
+                for (const label of toRemove) {
+                  try {
+                    await github.rest.issues.removeLabel({
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      issue_number: issueNumber, name: label
+                    });
+                    reportLines.push(`- Removed \`${label}\``);
+                  } catch (e) { core.warning(`Could not remove ${label}`); }
+                }
+
+                // Apply target status
+                if (drift.target_status && !isClosed) {
+                  try {
+                    await github.rest.issues.addLabels({
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      issue_number: issueNumber, labels: [drift.target_status]
+                    });
+                    reportLines.push(`- Applied \`${drift.target_status}\``);
+                  } catch (e) { core.warning(`Could not apply ${drift.target_status}`); }
+                }
+              }
+
+              reportLines.push('');
+
+              // Post comment on issue
+              const fixSummary = autoFixable.map(d =>
+                `Class ${d.class}: ${d.description.substring(0, 80)}`
+              ).join('; ');
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: [
+                  '## 🔧 State Reconciled',
+                  '',
+                  `| Field | Value |`,
+                  `|-------|-------|`,
+                  `| **Drift classes fixed** | ${autoFixable.map(d => d.class).join(', ')} |`,
+                  `| **Reconciled by** | @${context.actor} |`,
+                  `| **Date** | ${today} |`,
+                  '',
+                  `Drift summary: ${fixSummary}`,
+                  '',
+                  '---',
+                  '*Automated by CI/CD IssueOps | ci-cd-team*'
+                ].join('\n')
+              });
+            } else if (dryRun && autoFixable.length > 0) {
+              reportLines.push(`> ℹ️ **Dry run:** ${autoFixable.length} auto-fixable drift(s) found. Run with \`dry_run=false\` to apply.`);
+            }
+
+            if (!dryRun && drifts.filter(d => !d.auto_fixable).length > 0) {
+              reportLines.push('');
+              reportLines.push('### ⚠️ Manual action required for non-auto-fixable drift classes');
+              reportLines.push('See RUNBOOK.md for guidance on each class.');
+            }
+
+            reportLines.push('', '---', '*Automated by CI/CD IssueOps | ci-cd-team*');
+
+            const report = reportLines.join('\n');
+            core.info(report);
+
+            // Set outputs for downstream use
+            core.setOutput('drift_count', drifts.length.toString());
+            core.setOutput('auto_fixable_count', autoFixable.length.toString());
+            core.setOutput('has_drift', (drifts.length > 0).toString());
+            core.setOutput('drift_classes', drifts.map(d => d.class).join(','));
+            core.setOutput('report', report);
+
+            if (drifts.length > 0 && drifts.some(d => d.severity === 'HIGH')) {
+              core.warning(`HIGH severity drift detected on #${issueNumber}: ${drifts.filter(d=>d.severity==='HIGH').map(d=>d.class).join(', ')}`);
+            }

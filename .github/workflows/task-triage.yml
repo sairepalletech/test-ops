@@ -1,0 +1,705 @@
+name: Task Triage
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: task-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Architecture:
+#   parse-issue-body.js  → all field extraction
+#   get-pod-owner.js     → all CODEOWNERS lookups
+#   calculate-sla.js     → all SLA calculations
+#   check-wip.js         → all WIP checks
+#   post-comment.js      → all comment body generation
+#   lifecycle-timestamps.js → all lifecycle event recording
+#
+# This workflow contains NO inline field parsing, NO inline CODEOWNERS logic,
+# NO inline comment string building, NO inline WIP logic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+
+  lint:
+    name: Validate Workflow
+    uses: ./.github/workflows/yaml-lint.yml
+    with:
+      files: ".github/workflows/task-triage.yml"
+
+  triage-task:
+    name: Triage New Task
+    needs: lint
+    if: |
+      github.event_name == 'issues' &&
+      github.event.action == 'opened' &&
+      contains(github.event.issue.labels.*.name, 'type/task')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse fields via parse-issue-body.js
+        id: parse
+        shell: bash
+        run: |
+          printf '%s' "$ISSUE_BODY" > /tmp/issue_body.txt
+
+          FIELDS=$(node .github/scripts/parse-issue-body.js \
+            --body "$(cat /tmp/issue_body.txt)" \
+            --all 2>/dev/null || echo '{}')
+
+          extract() {
+            echo "$FIELDS" | node -e \
+              "let d='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const f=JSON.parse(d);console.log(f['$1']||'');}catch(e){console.log('')}})"
+          }
+
+          EPIC_NUM=$(echo "$FIELDS" | node -e "let d='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const f=JSON.parse(d);console.log(f._epic_number||'');}catch(e){console.log('')}})")
+          VERT=$(extract "Vertical")
+          VERT_LABEL=$(echo "$FIELDS" | node -e "let d='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const f=JSON.parse(d);console.log(f._vertical_label||'');}catch(e){console.log('')}})")
+          PRIO=$(extract "Priority")
+          PRIO_LABEL=$(echo "$FIELDS" | node -e "let d='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const f=JSON.parse(d);console.log(f._priority_label||'');}catch(e){console.log('')}})")
+          SYS=$(extract "Affected System")
+          ASGN=$(extract "Assignee")
+
+          echo "epic_number=$EPIC_NUM"     >> "$GITHUB_OUTPUT"
+          echo "vertical=$VERT"            >> "$GITHUB_OUTPUT"
+          echo "vertical_label=$VERT_LABEL">> "$GITHUB_OUTPUT"
+          echo "priority=$PRIO"            >> "$GITHUB_OUTPUT"
+          echo "priority_label=$PRIO_LABEL">> "$GITHUB_OUTPUT"
+          echo "affected_system=$SYS"      >> "$GITHUB_OUTPUT"
+          echo "assignee=$ASGN"            >> "$GITHUB_OUTPUT"
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+
+      - name: Lookup pod owner via get-pod-owner.js
+        id: pod
+        shell: bash
+        run: |
+          VERTICAL="${{ steps.parse.outputs.vertical }}"
+          if [ -n "$VERTICAL" ]; then
+            OWNER=$(node .github/scripts/get-pod-owner.js \
+              --vertical "$VERTICAL" \
+              --codeowners .github/CODEOWNERS 2>/dev/null || echo "")
+          else
+            OWNER=""
+          fi
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+
+      - name: Handle missing Epic number
+        if: steps.parse.outputs.epic_number == ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const ws = process.env.GITHUB_WORKSPACE;
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, labels: ['status/blocked']
+            });
+            const body = execSync(
+              `node .github/scripts/post-comment.js --event task-no-epic --data '{}'`,
+              { encoding: 'utf-8', cwd: ws }
+            );
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body: body.trim()
+            });
+
+      - name: Fetch parent Epic and determine routing
+        if: steps.parse.outputs.epic_number != ''
+        id: epic
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const ws = process.env.GITHUB_WORKSPACE;
+            const epicNumber = parseInt('${{ steps.parse.outputs.epic_number }}');
+
+            let epicIssue;
+            try {
+              const { data } = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: epicNumber
+              });
+              epicIssue = data;
+            } catch (e) {
+              const body = execSync(
+                `node .github/scripts/post-comment.js --event task-epic-not-found --data '${JSON.stringify({ epic_number: epicNumber })}'`,
+                { encoding: 'utf-8', cwd: ws }
+              );
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, labels: ['status/blocked']
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body: body.trim()
+              });
+              core.setOutput('status', 'not-found');
+              return;
+            }
+
+            const epicLabels = epicIssue.labels.map(l => l.name);
+            core.setOutput('epic_title', epicIssue.title);
+
+            if (epicLabels.includes('status/pending-approval')) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['status/blocked-pending-epic']
+              });
+              const body = execSync(
+                `node .github/scripts/post-comment.js --event task-blocked-epic --data '${JSON.stringify({ epic_number: epicNumber, epic_title: epicIssue.title })}'`,
+                { encoding: 'utf-8', cwd: ws }
+              );
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body: body.trim()
+              });
+              core.setOutput('status', 'pending');
+              return;
+            }
+
+            core.setOutput('status', 'active');
+
+      - name: Calculate SLA via calculate-sla.js
+        if: |
+          steps.parse.outputs.epic_number != '' &&
+          steps.epic.outputs.status == 'active'
+        id: sla
+        shell: bash
+        run: |
+          PRIO_LABEL="${{ steps.parse.outputs.priority_label }}"
+          PRIO="${{ steps.parse.outputs.priority }}"
+          TODAY=$(date -u +%Y-%m-%d)
+
+          case "$PRIO" in
+            "Critical") SLA_TEXT="Same business day from issue creation" ;;
+            "High")     SLA_TEXT="3 business days from /start" ;;
+            "Medium")   SLA_TEXT="7 business days from /start" ;;
+            "Low")      SLA_TEXT="14 business days from /start" ;;
+            *)          SLA_TEXT="3 business days from /start" ;;
+          esac
+          echo "sla_text=$SLA_TEXT" >> "$GITHUB_OUTPUT"
+
+      - name: Apply labels, stamp timestamp, post confirmation
+        if: |
+          steps.parse.outputs.epic_number != '' &&
+          steps.epic.outputs.status == 'active'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const ws = process.env.GITHUB_WORKSPACE;
+            const issueNumber = context.issue.number;
+            const today = new Date().toISOString().split('T')[0];
+
+            const vertical      = '${{ steps.parse.outputs.vertical }}';
+            const verticalLabel = '${{ steps.parse.outputs.vertical_label }}';
+            const priorityLabel = '${{ steps.parse.outputs.priority_label }}';
+            const priority      = '${{ steps.parse.outputs.priority }}';
+            const epicNumber    = '${{ steps.parse.outputs.epic_number }}';
+            const epicTitle     = '${{ steps.epic.outputs.epic_title }}';
+            const podOwner      = '${{ steps.pod.outputs.owner }}';
+            const affectedSystem= '${{ steps.parse.outputs.affected_system }}';
+            const slaText       = '${{ steps.sla.outputs.sla_text }}';
+            const assigneeRaw   = '${{ steps.parse.outputs.assignee }}';
+            const isCritical    = priority === 'Critical';
+
+            // Apply labels
+            const labelsToApply = ['status/review'];
+            if (verticalLabel) labelsToApply.push(verticalLabel);
+            if (priorityLabel) labelsToApply.push(priorityLabel);
+            if (isCritical)    labelsToApply.push('status/sprint');
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issueNumber, labels: labelsToApply
+            });
+
+            // Assign if provided
+            if (assigneeRaw && assigneeRaw.length > 0 && !assigneeRaw.includes('optional')) {
+              const handle = assigneeRaw.replace('@','').trim();
+              if (/^[a-zA-Z0-9-]+$/.test(handle)) {
+                try {
+                  await github.rest.issues.addAssignees({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    issue_number: issueNumber, assignees: [handle]
+                  });
+                } catch (e) { core.warning(`Could not assign to ${handle}: ${e.message}`); }
+              }
+            }
+
+            // Write lifecycle timestamp via script
+            const ts = execSync(
+              `node .github/scripts/lifecycle-timestamps.js --action write --event review --actor "${context.actor}"`,
+              { encoding: 'utf-8', cwd: ws }
+            ).trim();
+
+            // Generate confirmation comment via post-comment.js
+            const commentData = JSON.stringify({
+              epic_number: epicNumber, epic_title: epicTitle,
+              vertical: vertical || 'Not specified',
+              priority: priority || 'Not specified',
+              sla: slaText,
+              pod_owner: podOwner || null,
+              affected_system: affectedSystem || 'Not specified',
+              today
+            }).replace(/'/g, "'\\''");
+
+            const body = execSync(
+              `node .github/scripts/post-comment.js --event task-received --data '${commentData}'`,
+              { encoding: 'utf-8', cwd: ws }
+            );
+
+            // Post with embedded timestamp
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: body.trim() + '\n\n' + ts
+            });
+
+            // Notify pod owner
+            if (podOwner) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `${podOwner} — new **${vertical}** task awaiting triage.\n\nPost \`/accept\`, \`/defer\`, \`/duplicate #N\`, or \`/reject <reason>\`.${isCritical ? '\n\n> 🚨 Critical — 30-minute response expected.' : ''}\n\n---\n*Automated by CI/CD IssueOps | ci-cd-team*`
+              });
+            }
+
+
+      - name: Notify on workflow failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## ⚠️ Triage Workflow Failed',
+                '',
+                'The task triage workflow failed during processing of this issue.',
+                'This issue may not have been correctly labelled or routed.',
+                '',
+                '**Action required:** Check the [workflow run](https://github.com/' +
+                  context.repo.owner + '/' + context.repo.repo +
+                  '/actions/workflows/task-triage.yml) for details.',
+                '',
+                'If the issue is stuck in `status/review` with no pod owner notification,',
+                'the pod owner can manually post `/accept` to proceed.',
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });
+
+  handle-command:
+    name: Handle IssueOps Command
+    needs: lint
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      contains(github.event.issue.labels.*.name, 'type/task') &&
+      (
+        startsWith(github.event.comment.body, '/accept') ||
+        startsWith(github.event.comment.body, '/defer') ||
+        startsWith(github.event.comment.body, '/duplicate') ||
+        startsWith(github.event.comment.body, '/reject') ||
+        startsWith(github.event.comment.body, '/start') ||
+        startsWith(github.event.comment.body, '/block') ||
+        startsWith(github.event.comment.body, '/unblock') ||
+        startsWith(github.event.comment.body, '/validate') ||
+        startsWith(github.event.comment.body, '/approve-validation') ||
+        startsWith(github.event.comment.body, '/reject-validation') ||
+        startsWith(github.event.comment.body, '/feedback') ||
+        startsWith(github.event.comment.body, '/depends-on')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check command authorization via script
+        id: authz
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const ws = process.env.GITHUB_WORKSPACE;
+            const comment = context.payload.comment.body.trim();
+            const actor = context.actor;
+
+            // Extract command (first word)
+            const cmd = comment.split(/\s+/)[0].toLowerCase();
+
+            // Get pod owner and team lead from scripts
+            let podOwner = '';
+            let teamLead = '';
+            try {
+              const { data: issue } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number
+              });
+              const body = issue.body || '';
+              // Get vertical from parse-issue-body.js
+              const vertical = execSync(
+                `node .github/scripts/parse-issue-body.js --field "Vertical" --body "${body.replace(/"/g,'\"').replace(/\n/g,'\\n').replace(/'/g,"'\''")}"`  ,
+                { encoding: 'utf-8', cwd: ws }
+              ).trim();
+              if (vertical) {
+                podOwner = execSync(
+                  `node .github/scripts/get-pod-owner.js --vertical "${vertical}" --codeowners .github/CODEOWNERS 2>/dev/null || echo ""`,
+                  { encoding: 'utf-8', cwd: ws }
+                ).trim();
+              }
+              const allOwners = JSON.parse(execSync(
+                `node .github/scripts/get-pod-owner.js --all --codeowners .github/CODEOWNERS`,
+                { encoding: 'utf-8', cwd: ws }
+              ));
+              teamLead = allOwners._team_lead || '';
+            } catch (e) {
+              core.warning(`Could not resolve pod owner/team lead: ${e.message}`);
+            }
+
+            // Run authorization check via script
+            let authResult;
+            try {
+              const authRaw = execSync(
+                `node .github/scripts/check-authorization.js ` +
+                `--command "${cmd}" ` +
+                `--actor "${actor}" ` +
+                `--pod-owner "${podOwner}" ` +
+                `--team-lead "${teamLead}"`,
+                { encoding: 'utf-8', cwd: ws }
+              );
+              authResult = JSON.parse(authRaw);
+            } catch (e) {
+              core.warning(`Authorization check failed: ${e.message} — proceeding`);
+              core.setOutput('authorized', 'true');
+              core.setOutput('warning', '');
+              return;
+            }
+
+            core.setOutput('authorized', authResult.authorized.toString());
+            core.setOutput('warning', authResult.warning_message || '');
+            core.setOutput('should_block', authResult.should_block.toString());
+
+            if (authResult.should_block) {
+              // Post unauthorized comment and stop
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: [
+                  `## ❌ Unauthorized`,
+                  '',
+                  `@${actor} — ${authResult.reason}`,
+                  '',
+                  '---',
+                  '*Automated by CI/CD IssueOps | ci-cd-team*'
+                ].join('\n')
+              });
+              core.setFailed(`Unauthorized: ${actor} cannot run ${cmd}`);
+            } else if (authResult.warning_message) {
+              // Post role advisory warning but continue
+              core.warning(authResult.warning_message);
+            }
+
+      - name: Execute command via scripts
+        if: steps.authz.outputs.should_block != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const ws = process.env.GITHUB_WORKSPACE;
+            const comment = context.payload.comment.body.trim();
+            const issueNumber = context.issue.number;
+            const actor = context.actor;
+            const today = new Date().toISOString().split('T')[0];
+
+            // ── Generic helpers ────────────────────────────────────────────
+            async function getLabels() {
+              const { data } = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber
+              });
+              return data.labels.map(l => l.name);
+            }
+            async function removeLabel(name) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issueNumber, name
+                });
+              } catch (e) { /* not present */ }
+            }
+            async function addLabels(labels) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, labels
+              });
+            }
+
+            // post-comment.js wrapper
+            async function postComment(event, data = {}) {
+              const dataStr = JSON.stringify({ ...data, today })
+                .replace(/'/g, "'\\''");
+              const body = execSync(
+                `node .github/scripts/post-comment.js --event "${event}" --data '${dataStr}'`,
+                { encoding: 'utf-8', cwd: ws }
+              );
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, body: body.trim()
+              });
+            }
+
+            // lifecycle-timestamps.js wrapper — posts an invisible timestamp comment
+            async function stamp(event) {
+              const ts = execSync(
+                `node .github/scripts/lifecycle-timestamps.js --action write --event "${event}" --actor "${actor}"`,
+                { encoding: 'utf-8', cwd: ws }
+              ).trim();
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, body: ts
+              });
+            }
+
+            // ── /accept ────────────────────────────────────────────────────
+            if (comment.startsWith('/accept')) {
+              await removeLabel('status/review');
+              await removeLabel('status/triage');
+              await addLabels(['status/backlog']);
+              await stamp('backlog');
+              await postComment('accepted', { actor });
+            }
+
+            // ── /defer ─────────────────────────────────────────────────────
+            else if (comment.startsWith('/defer')) {
+              const reason = comment.replace('/defer','').trim() || 'No reason provided';
+              await removeLabel('status/review');
+              await addLabels(['status/backlog']);
+              await postComment('deferred', { actor, reason });
+            }
+
+            // ── /duplicate #N ──────────────────────────────────────────────
+            else if (comment.startsWith('/duplicate')) {
+              const m = comment.match(/#(\d+)/);
+              const dupNumber = m ? m[1] : 'unknown';
+              await postComment('duplicate', { actor, dup_number: dupNumber });
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, state: 'closed', state_reason: 'not_planned'
+              });
+            }
+
+            // ── /reject (task) ─────────────────────────────────────────────
+            else if (comment.startsWith('/reject') && !comment.startsWith('/reject-validation')) {
+              const reason = comment.replace('/reject','').trim() || 'No reason provided';
+              await postComment('rejected-task', { actor, reason });
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, state: 'closed', state_reason: 'not_planned'
+              });
+            }
+
+            // ── /start ─────────────────────────────────────────────────────
+            else if (comment.startsWith('/start')) {
+              const currentLabels = await getLabels();
+              const isCrossVertical = currentLabels.includes('vertical/cross');
+
+              const inProgressIssues = await github.paginate(
+                github.rest.issues.listForRepo, {
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  assignee: actor, labels: 'status/in-progress',
+                  state: 'open', per_page: 50
+                }
+              );
+
+              // WIP check via canonical script
+              const wipJson = JSON.stringify(
+                inProgressIssues.map(i => ({ number: i.number, title: i.title, pull_request: !!i.pull_request }))
+              ).replace(/'/g, "'\\''");
+
+              const wipResult = JSON.parse(execSync(
+                `node .github/scripts/check-wip.js --assignee "${actor}" --current-issue ${issueNumber} --in-progress '${wipJson}' --is-cross-vertical ${isCrossVertical}`,
+                { encoding: 'utf-8', cwd: ws }
+              ));
+
+              await removeLabel('status/sprint');
+              await removeLabel('status/backlog');
+              await removeLabel('status/review');
+              await addLabels(['status/in-progress']);
+
+              await github.rest.issues.addAssignees({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, assignees: [actor]
+              });
+
+              await stamp('in-progress');
+              await postComment('started', {
+                actor,
+                wip_warning: wipResult.warning_needed ? wipResult.message : ''
+              });
+            }
+
+            // ── /block ─────────────────────────────────────────────────────
+            else if (comment.startsWith('/block')) {
+              const reason = comment.replace('/block','').trim() || 'No reason provided';
+              await removeLabel('status/in-progress');
+              await addLabels(['status/blocked']);
+              await stamp('blocked');
+              await postComment('blocked', { actor, reason });
+
+              // Find Epic owner via parse-issue-body.js on the Epic
+              const issue = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber
+              });
+              const body = issue.data.body || '';
+
+              // Use the script to extract the Epic number from body
+              let epicOwnerTag = '';
+              try {
+                const epicNumStr = execSync(
+                  `node .github/scripts/parse-issue-body.js --field "Parent Epic Number" --body "${body.replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/'/g,"'\\''")}"`  ,
+                  { encoding: 'utf-8', cwd: ws }
+                ).trim();
+                const epicNum = parseInt(epicNumStr.replace(/[^0-9]/g,''));
+                if (epicNum) {
+                  const { data: epicIssue } = await github.rest.issues.get({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    issue_number: epicNum
+                  });
+                  const ownerStr = execSync(
+                    `node .github/scripts/parse-issue-body.js --field "Epic Owner" --body "${epicIssue.body.replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/'/g,"'\\''")}"`  ,
+                    { encoding: 'utf-8', cwd: ws }
+                  ).trim();
+                  if (ownerStr) epicOwnerTag = ownerStr.startsWith('@') ? ownerStr : '@' + ownerStr;
+                }
+              } catch (e) { core.info('Could not get Epic owner'); }
+
+              // Get team lead from CODEOWNERS via script (all owners output)
+              let teamLead = '';
+              try {
+                const allOwners = JSON.parse(execSync(
+                  `node .github/scripts/get-pod-owner.js --all --codeowners .github/CODEOWNERS`,
+                  { encoding: 'utf-8', cwd: ws }
+                ));
+                teamLead = allOwners._team_lead || '';
+              } catch (e) { /* ignore */ }
+
+              const mentions = [teamLead, epicOwnerTag].filter(Boolean).filter((v,i,a) => a.indexOf(v) === i).join(' ');
+              if (mentions) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  body: `${mentions} — this task is blocked and needs attention.\n\n---\n*Automated by CI/CD IssueOps | ci-cd-team*`
+                });
+              }
+            }
+
+            // ── /unblock ───────────────────────────────────────────────────
+            else if (comment.startsWith('/unblock')) {
+              const resolution = comment.replace('/unblock','').trim() || 'Blocker resolved';
+              await removeLabel('status/blocked');
+              await addLabels(['status/in-progress']);
+              // Resume SLA clock
+              const tsResume = execSync(
+                `node .github/scripts/lifecycle-timestamps.js --action write --event sla-resumed --actor "${actor}"`,
+                { encoding: 'utf-8', cwd: ws }
+              ).trim();
+              await stamp('unblocked');
+              await postComment('unblocked', { actor, resolution });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, body: tsResume
+              });
+            }
+
+            // ── /validate ──────────────────────────────────────────────────
+            else if (comment.startsWith('/validate')) {
+              await removeLabel('status/in-progress');
+              await removeLabel('status/feedback-required');
+              await addLabels(['status/validation']);
+              await stamp('validation');
+              await postComment('validated', { actor });
+            }
+
+            // ── /approve-validation ────────────────────────────────────────
+            else if (comment.startsWith('/approve-validation')) {
+              const note = comment.replace('/approve-validation','').trim();
+              await removeLabel('status/validation');
+              await removeLabel('status/feedback-required');
+              await removeLabel('status/overdue');
+              await addLabels(['status/done']);
+              await stamp('done');
+              await postComment('approved-validation', { actor, note: note || '' });
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, state: 'closed', state_reason: 'completed'
+              });
+            }
+
+            // ── /feedback ──────────────────────────────────────────────────
+            else if (comment.startsWith('/feedback')) {
+              const gaps = comment.replace('/feedback','').trim() || 'See comment thread';
+              await removeLabel('status/validation');
+              await addLabels(['status/feedback-required']);
+              await stamp('feedback-required');
+              await postComment('feedback', { actor, gaps });
+            }
+
+            // ── /reject-validation ─────────────────────────────────────────
+            else if (comment.startsWith('/reject-validation')) {
+              const reason = comment.replace('/reject-validation','').trim() || 'Outcome not met';
+              await removeLabel('status/validation');
+              await removeLabel('status/feedback-required');
+              await addLabels(['status/in-progress']);
+              await stamp('in-progress');
+              await postComment('rejected-validation', { actor, reason });
+            }
+
+            // ── /depends-on #N ─────────────────────────────────────────────
+            else if (comment.startsWith('/depends-on')) {
+              const m = comment.match(/#(\d+)/);
+              const depNumber = m ? m[1] : null;
+              if (depNumber) {
+                await addLabels(['has-dependency']);
+                // Pause SLA clock
+                const tsPause = execSync(
+                  `node .github/scripts/lifecycle-timestamps.js --action write --event sla-paused --actor "${actor}"`,
+                  { encoding: 'utf-8', cwd: ws }
+                ).trim();
+                await postComment('depends-on', { actor, dep_number: depNumber, issue_number: issueNumber });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issueNumber, body: tsPause
+                });
+                // Notify dependency issue
+                try {
+                  const depBody = execSync(
+                    `node .github/scripts/post-comment.js --event dep-notice --data '{"issue_number":"${issueNumber}","dep_number":"${depNumber}"}'`,
+                    { encoding: 'utf-8', cwd: ws }
+                  );
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    issue_number: parseInt(depNumber), body: depBody.trim()
+                  });
+                } catch (e) { core.warning(`Could not post on #${depNumber}`); }
+              }
+            }

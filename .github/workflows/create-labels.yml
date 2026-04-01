@@ -1,0 +1,115 @@
+name: Create Labels
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type YES to create all CI/CD team labels"
+        required: true
+        default: ""
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  create-labels:
+    name: Bootstrap CI/CD Team Labels
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'YES'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create all labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = [
+              // Status labels
+              { name: "status/pending-approval",    color: "E4E669", description: "Epic awaiting team lead approval before activation" },
+              { name: "status/triage",              color: "CFD3D7", description: "New issue awaiting pod owner review — triage gate" },
+              { name: "status/review",              color: "0075CA", description: "Awaiting pod owner review — auto-applied on task open" },
+              { name: "status/backlog",             color: "CFD3D7", description: "Accepted and ready to be pulled into a sprint" },
+              { name: "status/sprint",              color: "0052CC", description: "Pulled into the current bi-weekly sprint" },
+              { name: "status/in-progress",         color: "0E8A16", description: "Actively being worked on — SLA clock running" },
+              { name: "status/blocked",             color: "D93F0B", description: "Cannot proceed — reason documented — team lead notified" },
+              { name: "status/blocked-pending-epic",color: "B60205", description: "Task held — parent Epic not yet approved" },
+              { name: "status/feedback-required",   color: "FBCA04", description: "Validation returned gaps — developer needs to fix" },
+              { name: "status/validation",          color: "FBCA04", description: "Dev complete — awaiting sign-off" },
+              { name: "status/done",                color: "006B75", description: "Validated and closed" },
+              { name: "status/overdue",             color: "EE0701", description: "SLA breached — auto-stamped by daily digest" },
+              // Type labels
+              { name: "type/epic",                  color: "3E4B9E", description: "Top-level strategic initiative" },
+              { name: "type/task",                  color: "0075CA", description: "Unit of executable work — always has a parent Epic" },
+              { name: "type/bug",                   color: "D73A4A", description: "Something is broken" },
+              { name: "type/request",               color: "A2EEEF", description: "New capability or access request" },
+              { name: "type/change",                color: "E4E669", description: "Modification to existing working system" },
+              // Priority labels
+              { name: "priority/critical",          color: "B60205", description: "Same day — clock starts at creation — bypasses backlog" },
+              { name: "priority/high",              color: "D93F0B", description: "3 business days from /start" },
+              { name: "priority/medium",            color: "FBCA04", description: "7 business days from /start" },
+              { name: "priority/low",               color: "0E8A16", description: "14 business days from /start" },
+              // Vertical labels
+              { name: "vertical/datadog",           color: "632CA6", description: "Datadog observability" },
+              { name: "vertical/artifactory",       color: "40BE46", description: "JFrog Artifactory artifact management" },
+              { name: "vertical/github-platform",   color: "24292F", description: "GitHub Platform — infra, runners, workflows, Copilot" },
+              { name: "vertical/jira-wiki",         color: "0052CC", description: "JIRA and Confluence wiki" },
+              { name: "vertical/tfe",               color: "7B42BC", description: "Terraform Enterprise" },
+              { name: "vertical/gitlab-pipelines",  color: "FC6D26", description: "GitLab CI/CD pipelines" },
+              { name: "vertical/cross",             color: "CFD3D7", description: "Cross-vertical initiative" },
+              // Dependency labels
+              { name: "has-dependency",             color: "F59E0B", description: "Waiting on another issue — SLA clock paused" },
+              // Governance labels
+              { name: "OKR",                        color: "5319E7", description: "Aligned to a company OKR — preserved after Epic closes" },
+              { name: "2026",                       color: "5319E7", description: "Current year initiative" },
+              { name: "epic",                       color: "3E4B9E", description: "Applied to all approved Epics" },
+              { name: "standup-digest",             color: "0075CA", description: "Reserved for the pinned daily standup issue" },
+            ];
+
+            let created = 0;
+            let updated = 0;
+            let failed = 0;
+
+            for (const label of labels) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ...label
+                });
+                core.info(`Created: ${label.name}`);
+                created++;
+              } catch (e) {
+                if (e.status === 422) {
+                  // Label exists — update it
+                  try {
+                    await github.rest.issues.updateLabel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      name: label.name,
+                      color: label.color,
+                      description: label.description
+                    });
+                    core.info(`Updated: ${label.name}`);
+                    updated++;
+                  } catch (ue) {
+                    core.warning(`Could not update ${label.name}: ${ue.message}`);
+                    failed++;
+                  }
+                } else {
+                  core.warning(`Could not create ${label.name}: ${e.message}`);
+                  failed++;
+                }
+              }
+            }
+
+            core.info(`\nLabel bootstrap complete:`);
+            core.info(`  Created: ${created}`);
+            core.info(`  Updated: ${updated}`);
+            core.info(`  Failed:  ${failed}`);
+            core.info(`  Total:   ${labels.length}`);
+
+            if (failed > 0) {
+              core.setFailed(`${failed} labels failed to create or update`);
+            }

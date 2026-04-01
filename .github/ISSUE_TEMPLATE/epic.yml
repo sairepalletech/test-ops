@@ -1,0 +1,156 @@
+name: Epic
+description: Strategic initiative for the CI/CD team — requires approval before tasks can be linked
+title: "[EPIC] "
+labels: ["type/epic", "status/pending-approval"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Epic Intake
+        Complete all required fields. This Epic will remain in **pending approval** status
+        until reviewed. Once you submit, comment `/approve` to activate or `/reject <reason>` to close.
+        > **Only maintainers with write access can approve or reject.**
+
+  - type: input
+    id: epic_title
+    attributes:
+      label: Epic Title
+      description: One clear sentence describing this initiative — what problem are we solving
+      placeholder: e.g. Migrate JFrog Artifactory from on-prem to SaaS on AWS
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What is this Epic about?
+      description: Two to three sentences describing the problem being solved — not the solution
+      placeholder: Describe the problem, not the solution. What is broken, missing, or risky today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why does this matter?
+      description: Business justification — what breaks or suffers if this is not done
+      placeholder: Describe the business impact. What happens if we do nothing?
+    validations:
+      required: true
+
+  - type: input
+    id: sponsor
+    attributes:
+      label: Business Sponsor
+      description: Person or team requesting or funding this work — not the technical owner
+      placeholder: e.g. Platform Engineering Lead
+    validations:
+      required: true
+
+  - type: input
+    id: okr
+    attributes:
+      label: OKR Alignment
+      description: Which OKR does this Epic advance
+      placeholder: e.g. Reduce infrastructure toil by 40% in 2026
+    validations:
+      required: true
+
+  - type: textarea
+    id: success
+    attributes:
+      label: Success Criteria
+      description: Measurable definition of done at the Epic level — how will we know this is complete
+      placeholder: e.g. All pipelines across 6 verticals using SaaS endpoint, zero artifact failures post-cutover, latency within 10% of on-prem baseline
+    validations:
+      required: true
+
+  - type: input
+    id: owner
+    attributes:
+      label: Epic Owner
+      description: GitHub handle of the CI/CD team member accountable end to end
+      placeholder: e.g. @username
+    validations:
+      required: true
+
+  - type: dropdown
+    id: vertical
+    attributes:
+      label: Vertical
+      description: Which CI/CD tool or platform does this Epic relate to — routes to the correct pod owner
+      options:
+        - Datadog
+        - Artifactory
+        - GitHub Platform
+        - JIRA & Wiki
+        - TFE
+        - GitLab Pipelines
+        - Cross-vertical
+    validations:
+      required: true
+
+  - type: dropdown
+    id: effort
+    attributes:
+      label: Estimated Effort
+      description: Rough sizing — not story points
+      options:
+        - Small (1-2 tasks, fits in one sprint)
+        - Medium (3-5 tasks, fits in one sprint)
+        - Large (6-10 tasks, spans two sprints)
+        - XL (10+ tasks, spans multiple sprints)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: "Critical: same day | High: 1 biz day | Medium: 3 biz days | Low: next sprint"
+      options:
+        - Critical
+        - High
+        - Medium
+        - Low
+    validations:
+      required: true
+
+  - type: input
+    id: target_sprint
+    attributes:
+      label: Target Sprint
+      description: Which bi-weekly sprint should this close in
+      placeholder: e.g. Sprint 8 — May 12
+    validations:
+      required: false
+
+  - type: input
+    id: doc_link
+    attributes:
+      label: Documentation Link
+      description: Confluence, Notion, or Google Doc with the full specification
+      placeholder: https://
+    validations:
+      required: false
+
+  - type: input
+    id: related_epics
+    attributes:
+      label: Related Epic Numbers
+      description: Any upstream or downstream Epic dependencies
+      placeholder: e.g. #12 #15
+    validations:
+      required: false
+
+  - type: textarea
+    id: repos
+    attributes:
+      label: Affected Repositories
+      description: Which repos are in scope for this Epic — one per line
+      placeholder: |
+        cicd-pipelines
+        github-runners
+        tfe-modules
+    validations:
+      required: false

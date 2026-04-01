@@ -1,0 +1,40 @@
+name: YAML Lint
+
+on:
+  workflow_call:
+    inputs:
+      files:
+        description: Files or glob pattern to lint
+        required: false
+        type: string
+        default: ".github/**/*.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  yaml-lint:
+    name: Lint YAML Files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run yamllint
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          file_or_dir: ${{ inputs.files }}
+          config_data: |
+            extends: default
+            rules:
+              line-length:
+                max: 160
+                level: warning
+              truthy:
+                allowed-values: ["true", "false"]
+              comments:
+                min-spaces-from-content: 1
+              braces:
+                max-spaces-inside: 1
+              brackets:
+                max-spaces-inside: 1

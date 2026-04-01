@@ -1,0 +1,108 @@
+name: WIP Enforcement
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: wip-check-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+
+  wip-check:
+    name: Check WIP Limit
+    if: |
+      github.event_name == 'issues' &&
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'status/in-progress'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check WIP via canonical script
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const issue = context.payload.issue;
+            const issueNumber = issue.number;
+            const assignees = issue.assignees.map(a => a.login);
+
+            if (assignees.length === 0) {
+              core.info('No assignees — skipping WIP check');
+              return;
+            }
+
+            const isCrossVertical = issue.labels.some(l => l.name === 'vertical/cross');
+
+            for (const assignee of assignees) {
+              // Fetch all in-progress issues for this developer
+              const inProgressIssues = await github.paginate(
+                github.rest.issues.listForRepo, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  assignee,
+                  labels: 'status/in-progress',
+                  state: 'open',
+                  per_page: 50
+                }
+              );
+
+              // Run canonical check-wip.js
+              let wipResult;
+              try {
+                const json = JSON.stringify(inProgressIssues.map(i => ({
+                  number: i.number,
+                  title: i.title,
+                  pull_request: !!i.pull_request
+                })));
+                const out = execSync(
+                  `node .github/scripts/check-wip.js ` +
+                  `--assignee "${assignee}" ` +
+                  `--current-issue ${issueNumber} ` +
+                  `--in-progress '${json.replace(/'/g, "'\\''")}' ` +
+                  `--is-cross-vertical ${isCrossVertical}`,
+                  { encoding: 'utf-8', cwd: process.env.GITHUB_WORKSPACE || '.' }
+                );
+                wipResult = JSON.parse(out);
+              } catch (e) {
+                core.warning(`check-wip.js failed: ${e.message}`);
+                continue;
+              }
+
+              if (!wipResult.warning_needed) {
+                core.info(`WIP OK for @${assignee}: ${wipResult.current_count}/${wipResult.limit}`);
+                continue;
+              }
+
+              // Build and post warning comment via post-comment.js
+              let commentBody;
+              try {
+                commentBody = execSync(
+                  `node .github/scripts/post-comment.js --event wip-warning --data '${JSON.stringify({
+                    actor: assignee,
+                    count: wipResult.current_count,
+                    limit: wipResult.limit,
+                    others: wipResult.others
+                  }).replace(/'/g, "'\\''")}' `,
+                  { encoding: 'utf-8', cwd: process.env.GITHUB_WORKSPACE || '.' }
+                );
+              } catch (e) {
+                commentBody = wipResult.message + '\n\n---\n*Automated by CI/CD IssueOps | ci-cd-team*';
+              }
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: commentBody
+              });
+
+              core.info(`WIP warning posted for @${assignee} (${wipResult.current_count}/${wipResult.limit})`);
+            }

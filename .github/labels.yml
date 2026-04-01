@@ -1,0 +1,141 @@
+# CI/CD Team Label Configuration
+# Apply with: gh label import --file .github/labels.yml
+# Or use the create-labels.yml workflow
+
+# ── Status Labels ────────────────────────────────────────────────────────────
+- name: "status/pending-approval"
+  color: "E4E669"
+  description: "Epic awaiting team lead approval before activation"
+
+- name: "status/triage"
+  color: "CFD3D7"
+  description: "New issue awaiting pod owner review — triage gate"
+
+- name: "status/review"
+  color: "0075CA"
+  description: "Awaiting pod owner review — auto-applied on task open"
+
+- name: "status/backlog"
+  color: "CFD3D7"
+  description: "Accepted and ready to be pulled into a sprint"
+
+- name: "status/sprint"
+  color: "0052CC"
+  description: "Pulled into the current bi-weekly sprint"
+
+- name: "status/in-progress"
+  color: "0E8A16"
+  description: "Actively being worked on — SLA clock running"
+
+- name: "status/blocked"
+  color: "D93F0B"
+  description: "Cannot proceed — reason documented in comments — team lead notified"
+
+- name: "status/blocked-pending-epic"
+  color: "B60205"
+  description: "Task held — parent Epic not yet approved"
+
+- name: "status/feedback-required"
+  color: "FBCA04"
+  description: "Validation returned gaps — developer needs to fix and re-validate"
+
+- name: "status/validation"
+  color: "FBCA04"
+  description: "Dev complete — awaiting pod owner or team lead sign-off"
+
+- name: "status/done"
+  color: "006B75"
+  description: "Validated and closed — sprint velocity counted"
+
+- name: "status/overdue"
+  color: "EE0701"
+  description: "SLA breached — auto-stamped by daily digest workflow"
+
+# ── Type Labels ──────────────────────────────────────────────────────────────
+- name: "type/epic"
+  color: "3E4B9E"
+  description: "Top-level strategic initiative — parent container for tasks"
+
+- name: "type/task"
+  color: "0075CA"
+  description: "Unit of executable work — always has a parent Epic"
+
+- name: "type/bug"
+  color: "D73A4A"
+  description: "Something is broken — production issues use priority/critical"
+
+- name: "type/request"
+  color: "A2EEEF"
+  description: "New capability, access, or feature request"
+
+- name: "type/change"
+  color: "E4E669"
+  description: "Modification to an existing working system"
+
+# ── Priority Labels ──────────────────────────────────────────────────────────
+- name: "priority/critical"
+  color: "B60205"
+  description: "Same day — clock starts at creation — bypasses backlog"
+
+- name: "priority/high"
+  color: "D93F0B"
+  description: "3 business days from /start — 1 biz day acknowledgment"
+
+- name: "priority/medium"
+  color: "FBCA04"
+  description: "7 business days from /start — 3 biz day acknowledgment"
+
+- name: "priority/low"
+  color: "0E8A16"
+  description: "14 business days from /start — next sprint acknowledgment"
+
+# ── Vertical Labels ──────────────────────────────────────────────────────────
+- name: "vertical/datadog"
+  color: "632CA6"
+  description: "Datadog observability — monitors, dashboards, alerts, custom metrics"
+
+- name: "vertical/artifactory"
+  color: "40BE46"
+  description: "JFrog Artifactory — artifact management, repo config, SaaS migration"
+
+- name: "vertical/github-platform"
+  color: "24292F"
+  description: "GitHub Platform — infra, Windows runners, workflows, Copilot"
+
+- name: "vertical/jira-wiki"
+  color: "0052CC"
+  description: "JIRA & Wiki — project tracking, Confluence, webhooks"
+
+- name: "vertical/tfe"
+  color: "7B42BC"
+  description: "Terraform Enterprise — workspace management, module registry"
+
+- name: "vertical/gitlab-pipelines"
+  color: "FC6D26"
+  description: "GitLab Pipelines — CI/CD pipeline migration, runner management"
+
+- name: "vertical/cross"
+  color: "CFD3D7"
+  description: "Cross-vertical — affects multiple tools or platforms"
+
+# ── Dependency Labels ────────────────────────────────────────────────────────
+- name: "has-dependency"
+  color: "F59E0B"
+  description: "This issue is waiting on another issue — SLA clock paused"
+
+# ── Governance Labels ────────────────────────────────────────────────────────
+- name: "OKR"
+  color: "5319E7"
+  description: "Strategically aligned to a company OKR — preserved after Epic closes"
+
+- name: "2026"
+  color: "5319E7"
+  description: "Current year initiative — year-end OKR filter"
+
+- name: "epic"
+  color: "3E4B9E"
+  description: "Applied to all approved Epics — identifies parent containers"
+
+- name: "standup-digest"
+  color: "0075CA"
+  description: "Reserved for the pinned daily standup issue — do not apply manually"

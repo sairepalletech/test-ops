@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: CI/CD Team Documentation
+    url: https://github.com/your-org/your-repo/wiki
+    about: Read the CI/CD team wiki before submitting an issue
+  - name: Urgent — Slack #cicd-team
+    url: https://slack.com
+    about: For production emergencies that cannot wait for issue triage

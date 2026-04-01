@@ -1,0 +1,112 @@
+name: Task
+description: Unit of work tied to a parent Epic — must reference an approved Epic
+title: "[TASK] "
+labels: ["type/task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Task Intake
+        Every task must be linked to an **approved Epic**. Tasks submitted against a
+        pending Epic will be automatically held until the Epic is approved.
+        The pod owner for your selected vertical will be notified automatically.
+
+  - type: input
+    id: task_title
+    attributes:
+      label: Task Title
+      description: Short descriptive title for this Task
+      placeholder: e.g. Fix CPU monitor false alert threshold on prod pipeline
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What are you doing?
+      description: Plain English description of the work — what specifically needs to happen
+      placeholder: Describe the change or work to be done in plain English
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why are you doing it?
+      description: Business or technical reason — what problem does this solve
+      placeholder: Describe the problem this solves or the value it delivers
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Two sentence max — this appears in the standup digest
+      placeholder: Two sentence summary of this task for standup and board visibility
+    validations:
+      required: true
+
+  - type: input
+    id: outcome
+    attributes:
+      label: Expected Outcome
+      description: One sentence definition of done — this is the validation gate
+      placeholder: e.g. CPU monitor fires only on genuine spikes above 85% with zero false alerts during normal pipeline runs
+    validations:
+      required: true
+
+  - type: input
+    id: epic_ref
+    attributes:
+      label: Parent Epic Number
+      description: Must be an approved Epic — enter the issue number. The workflow will auto-parent this task.
+      placeholder: e.g. #10
+    validations:
+      required: true
+
+  - type: dropdown
+    id: vertical
+    attributes:
+      label: Vertical
+      description: Which CI/CD tool does this task relate to — routes to the correct pod owner via CODEOWNERS
+      options:
+        - Datadog
+        - Artifactory
+        - GitHub Platform
+        - JIRA & Wiki
+        - TFE
+        - GitLab Pipelines
+    validations:
+      required: true
+
+  - type: input
+    id: assignee
+    attributes:
+      label: Assignee
+      description: GitHub handle of the developer picking this up — leave blank and the pod owner will assign during triage
+      placeholder: e.g. @username (optional — pod owner assigns if blank)
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: "Critical: same day from creation | High: 3 biz days from /start | Medium: 7 biz days | Low: next sprint"
+      options:
+        - Critical
+        - High
+        - Medium
+        - Low
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: Affected System
+      description: Repo name, pipeline name, or tool — captured in daily digest CSV
+      placeholder: e.g. github-actions-ci / jfrog-artifactory / datadog-prod-monitors
+    validations:
+      required: true

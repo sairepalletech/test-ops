@@ -1,0 +1,280 @@
+name: Standup Check
+
+on:
+  schedule:
+    - cron: "30 6 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: standup-check
+  cancel-in-progress: false
+
+jobs:
+
+  lint:
+    name: Validate Workflow
+    uses: ./.github/workflows/yaml-lint.yml
+    with:
+      files: ".github/workflows/standup-check.yml"
+
+  standup:
+    name: Post Daily Standup Digest
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate standup digest
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const today = new Date().toISOString().split('T')[0];
+            const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+
+            // Fetch all open issues with their labels
+            const allIssues = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100
+              }
+            );
+
+            // Filter out PRs
+            const issues = allIssues.filter(i => !i.pull_request);
+
+            // Categorise
+            const blocked = issues.filter(i =>
+              i.labels.some(l => l.name === 'status/blocked')
+            );
+            const overdue = issues.filter(i =>
+              i.labels.some(l => l.name === 'status/overdue')
+            );
+            const inValidation = issues.filter(i =>
+              i.labels.some(l => l.name === 'status/validation')
+            );
+            const inProgress = issues.filter(i =>
+              i.labels.some(l => l.name === 'status/in-progress')
+            );
+            const newToday = issues.filter(i => {
+              const created = new Date(i.created_at);
+              return created.toISOString().split('T')[0] === today;
+            });
+
+            // Stale blocked — no update to the blocked timestamp in 48 hours
+            // Use lifecycle-timestamps.js to find when issue actually entered blocked state
+            const { execSync } = require('child_process');
+            const ws = process.env.GITHUB_WORKSPACE;
+
+            const staleBlocked = [];
+            for (const i of blocked) {
+              let blockedSince = new Date(i.updated_at); // fallback
+              try {
+                const comments = await github.paginate(
+                  github.rest.issues.listComments, {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: i.number,
+                    per_page: 100
+                  }
+                );
+                const commentsJson = JSON.stringify(
+                  comments.map(c => ({ id: c.id, body: c.body, created_at: c.created_at }))
+                ).replace(/'/g, "\'");
+                const tsRaw = execSync(
+                  `node .github/scripts/lifecycle-timestamps.js --action read --event blocked --comments '${commentsJson}'`,
+                  { encoding: 'utf-8', cwd: ws }
+                ).trim();
+                if (tsRaw && tsRaw !== 'null') blockedSince = new Date(tsRaw);
+              } catch (e) {
+                core.info(`#${i.number}: using updated_at for blocked staleness check`);
+              }
+              if (blockedSince < new Date(twoDaysAgo)) staleBlocked.push({ ...i, _blockedSince: blockedSince });
+            }
+
+            core.info(`Standup check: blocked=${blocked.length} overdue=${overdue.length} stale_blocked=${staleBlocked.length}`);
+
+            // Nudge stale blocked tasks
+            for (const issue of staleBlocked) {
+              const assignees = issue.assignees.map(a => `@${a.login}`).join(' ');
+              const body = issue.body || '';
+
+              // Find Epic owner
+            // Use parse-issue-body.js for Epic number extraction
+              let epicNumber = null;
+              let epicOwnerTag = '';
+              try {
+                const bodyForParse = (issue.body || '').replace(/'/g, "\'");
+                const epicNumStr = execSync(
+                  `node .github/scripts/parse-issue-body.js --field "Parent Epic Number" --body '${bodyForParse}'`,
+                  { encoding: 'utf-8', cwd: ws }
+                ).trim();
+                epicNumber = epicNumStr ? parseInt(epicNumStr.replace(/[^0-9]/g,'')) : null;
+              } catch (e) { /* no Epic */ }
+
+              if (epicNumber) {
+                try {
+                  const { data: epicIssue } = await github.rest.issues.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: epicNumber
+                  });
+                  const ownerStr = execSync(
+                    `node .github/scripts/parse-issue-body.js --field "Epic Owner" --body '${(epicIssue.body||'').replace(/'/g,"\'")}' `,
+                    { encoding: 'utf-8', cwd: ws }
+                  ).trim();
+                  if (ownerStr) epicOwnerTag = ownerStr;
+                } catch (e) {
+                  core.info(`Could not fetch Epic #${epicNumber}`);
+                }
+              }
+
+              const days = Math.floor((Date.now() - new Date(issue._blockedSince || issue.updated_at)) / (1000 * 60 * 60 * 24));
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: [
+                  '## 🔔 Blocked Issue Alert — No Update in 48 Hours',
+                  '',
+                  `${assignees} — this issue has been blocked for **${days} day(s)** with no update.`,
+                  epicOwnerTag ? `${epicOwnerTag} — as Epic owner, please assist if possible.` : '',
+                  '',
+                  'Please provide one of:',
+                  '- An update on the current status and expected resolution',
+                  '- `/unblock` with resolution details if the blocker is cleared',
+                  '- Escalation request if external help is needed',
+                  '',
+                  '---',
+                  '*Automated by CI/CD IssueOps | ci-cd-team*'
+                ].filter(l => l !== null).join('\n')
+              });
+            }
+
+            // Skip standup post if everything is healthy
+            if (blocked.length === 0 && overdue.length === 0 && staleBlocked.length === 0) {
+              core.info('All clear — no standup post needed');
+              return;
+            }
+
+            // Find or create pinned standup issue
+            const standupIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'standup-digest',
+              state: 'open',
+              per_page: 1
+            });
+
+            let standupIssueNumber;
+            if (standupIssues.data.length > 0) {
+              standupIssueNumber = standupIssues.data[0].number;
+            } else {
+              // Create pinned standup issue
+              const { data: newIssue } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'CI/CD Team Daily Standup Digest',
+                body: [
+                  '## CI/CD Team Daily Standup',
+                  '',
+                  'This issue is the pinned standup digest. The standup-check workflow',
+                  'posts a daily comment here when items need attention.',
+                  '',
+                  'If all metrics are green, no comment is posted — silence is good news.',
+                  '',
+                  '---',
+                  '*Managed by CI/CD IssueOps | ci-cd-team*'
+                ].join('\n'),
+                labels: ['standup-digest']
+              });
+              standupIssueNumber = newIssue.number;
+              core.info(`Created standup issue #${standupIssueNumber}`);
+            }
+
+            // Build in-progress table
+            const ipRows = inProgress.slice(0, 10).map(i => {
+              const priority = i.labels.find(l => l.startsWith('priority/'));
+              const assignee = i.assignees.length > 0 ? `@${i.assignees[0].login}` : 'unassigned';
+              // Use lifecycle timestamp for accurate days-in-progress
+              let days = Math.floor((Date.now() - new Date(i.updated_at)) / (1000 * 60 * 60 * 24)); // fallback
+              try {
+                const ipComments = await github.paginate(github.rest.issues.listComments, {
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: i.number, per_page: 100
+                });
+                const ipJson = JSON.stringify(ipComments.map(c => ({ id: c.id, body: c.body, created_at: c.created_at }))).replace(/'/g, "\'");
+                const elapsedJson = execSync(
+                  `node .github/scripts/lifecycle-timestamps.js --action elapsed --event in-progress --today ${today} --comments '${ipJson}'`,
+                  { encoding: 'utf-8', cwd: ws }
+                );
+                const elapsed = JSON.parse(elapsedJson);
+                if (elapsed.effective_days !== null) days = elapsed.effective_days;
+              } catch (e) { /* fallback already set */ }
+              const isOverdue = i.labels.some(l => l.name === 'status/overdue');
+              return `| #${i.number} | ${i.title.substring(0, 50)} | ${assignee} | ${(priority?.name || 'none').replace('priority/', '')} | Day ${days} | ${isOverdue ? '🔴 OVERDUE' : '🟢 OK'} |`;
+            }).join('\n');
+
+            // Build blocked table
+            const blockedRows = blocked.map(i => {
+              const assignee = i.assignees.length > 0 ? `@${i.assignees[0].login}` : 'unassigned';
+              // Use lifecycle blocked timestamp for accurate days-blocked
+              let days = Math.floor((Date.now() - new Date(i.updated_at)) / (1000 * 60 * 60 * 24)); // fallback
+              try {
+                const bComments = await github.paginate(github.rest.issues.listComments, {
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: i.number, per_page: 100
+                });
+                const bJson = JSON.stringify(bComments.map(c => ({ id: c.id, body: c.body, created_at: c.created_at }))).replace(/'/g, "\'");
+                const bElapsedJson = execSync(
+                  `node .github/scripts/lifecycle-timestamps.js --action elapsed --event blocked --today ${today} --comments '${bJson}'`,
+                  { encoding: 'utf-8', cwd: ws }
+                );
+                const bElapsed = JSON.parse(bElapsedJson);
+                if (bElapsed.effective_days !== null) days = bElapsed.effective_days;
+              } catch (e) { /* fallback already set */ }
+              return `| #${i.number} | ${i.title.substring(0, 45)} | ${assignee} | ${days} days |`;
+            }).join('\n');
+
+            // Post standup digest
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: standupIssueNumber,
+              body: [
+                `## 📊 Standup Digest — ${today}`,
+                '',
+                '| Metric | Count | Status |',
+                '|--------|-------|--------|',
+                `| New today | ${newToday.length} | ${newToday.length > 5 ? '🟡 High intake' : '🟢 Normal'} |`,
+                `| In progress | ${inProgress.length} | ${inProgress.length > 0 ? '🔵 Active' : '⚪ None'} |`,
+                `| Blocked | ${blocked.length} | ${blocked.length > 0 ? '🔴 Needs attention' : '🟢 Clear'} |`,
+                `| Awaiting validation | ${inValidation.length} | ${inValidation.length > 3 ? '🟡 Review queue building' : '🟢 OK'} |`,
+                `| SLA breached | ${overdue.length} | ${overdue.length > 0 ? '🔴 Immediate action needed' : '🟢 All within SLA'} |`,
+                '',
+                inProgress.length > 0 ? [
+                  '### In Progress',
+                  '| # | Title | Assignee | Priority | Age | SLA |',
+                  '|---|-------|----------|----------|-----|-----|',
+                  ipRows
+                ].join('\n') : '',
+                '',
+                blocked.length > 0 ? [
+                  '### Blocked',
+                  '| # | Title | Assignee | Days blocked |',
+                  '|---|-------|----------|--------------|',
+                  blockedRows
+                ].join('\n') : '',
+                '',
+                `Download full CSV from the [daily-digest workflow](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/workflows/daily-digest.yml) run for today.`,
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].filter(l => l !== '').join('\n')
+            });
+
+            core.info(`Posted standup digest to issue #${standupIssueNumber}`);

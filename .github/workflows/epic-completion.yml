@@ -1,0 +1,159 @@
+name: Epic Completion Check
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check-epic-completion:
+    name: Check if Parent Epic is Complete
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Epic completion
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const closedIssue = context.payload.issue;
+            const body = closedIssue.body || '';
+            const today = new Date().toISOString().split('T')[0];
+
+            // Extract parent Epic number
+            const epicMatch = body.match(/### Parent Epic Number\s*\n+([^\n]+)/);
+            if (!epicMatch) {
+              core.info('No parent Epic found on this issue — skipping');
+              return;
+            }
+
+            const epicNumber = parseInt(epicMatch[1].replace(/[^0-9]/g, ''));
+            if (!epicNumber) {
+              core.info('Could not parse Epic number — skipping');
+              return;
+            }
+
+            core.info(`Checking Epic #${epicNumber} for completion`);
+
+            // Get the Epic issue
+            let epicIssue;
+            try {
+              const { data } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: epicNumber
+              });
+              epicIssue = data;
+            } catch (e) {
+              core.warning(`Could not fetch Epic #${epicNumber}: ${e.message}`);
+              return;
+            }
+
+            if (epicIssue.state === 'closed') {
+              core.info(`Epic #${epicNumber} is already closed`);
+              return;
+            }
+
+            // Find all open tasks referencing this Epic
+            const allOpenIssues = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: 'type/task',
+                per_page: 100
+              }
+            );
+
+            const epicPattern = new RegExp(`#${epicNumber}\\b`);
+            const openChildTasks = allOpenIssues.filter(i =>
+              i.body && epicPattern.test(i.body)
+            );
+
+            // Find all closed tasks referencing this Epic
+            const allClosedIssues = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'closed',
+                labels: 'type/task',
+                per_page: 100
+              }
+            );
+
+            const closedChildTasks = allClosedIssues.filter(i =>
+              i.body && epicPattern.test(i.body)
+            );
+
+            const totalTasks = openChildTasks.length + closedChildTasks.length;
+            const completedTasks = closedChildTasks.length;
+
+            core.info(`Epic #${epicNumber}: ${completedTasks}/${totalTasks} tasks complete, ${openChildTasks.length} still open`);
+
+            if (openChildTasks.length > 0) {
+              // Epic not complete — post progress update
+              const progressPct = totalTasks > 0
+                ? Math.round((completedTasks / totalTasks) * 100)
+                : 0;
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: epicNumber,
+                body: [
+                  `## 📈 Epic Progress Update`,
+                  '',
+                  `Task **#${closedIssue.number}** has been completed.`,
+                  '',
+                  `| Metric | Value |`,
+                  `|--------|-------|`,
+                  `| **Completed tasks** | ${completedTasks} of ${totalTasks} (${progressPct}%) |`,
+                  `| **Remaining open** | ${openChildTasks.length} |`,
+                  `| **Open tasks** | ${openChildTasks.map(i => `#${i.number}`).join(', ')} |`,
+                  '',
+                  '---',
+                  '*Automated by CI/CD IssueOps | ci-cd-team*'
+                ].join('\n')
+              });
+              return;
+            }
+
+            // All tasks complete — close the Epic
+            const epicLabels = epicIssue.labels.map(l => l.name);
+
+            // Parse Epic ID from previous approval comment if available
+            const year = new Date().getFullYear();
+            const epicId = `EPIC-${year}-${String(epicNumber).padStart(3, '0')}`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: epicNumber,
+              body: [
+                '## 🎉 Epic Complete — All Tasks Delivered',
+                '',
+                `| Field | Value |`,
+                `|-------|-------|`,
+                `| **Epic ID** | \`${epicId}\` |`,
+                `| **Completed** | ${today} |`,
+                `| **Tasks delivered** | ${completedTasks} of ${completedTasks} |`,
+                `| **OKR tag** | Preserved for year-end reporting |`,
+                '',
+                '**All child tasks have been validated and closed.**',
+                'This Epic is now complete.',
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });
+
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: epicNumber,
+              state: 'closed',
+              state_reason: 'completed'
+            });
+
+            core.info(`Closed Epic #${epicNumber} — all ${totalTasks} tasks complete`);

@@ -1,0 +1,184 @@
+name: Critical Fast Lane
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: critical-fast-lane-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+
+  lint:
+    name: Validate Workflow
+    uses: ./.github/workflows/yaml-lint.yml
+    with:
+      files: ".github/workflows/critical-fast-lane.yml"
+
+  critical-bypass:
+    name: Fast Lane Critical Issue
+    needs: lint
+    if: |
+      github.event_name == 'issues' &&
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'priority/critical' &&
+      !contains(github.event.issue.labels.*.name, 'type/epic')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast track critical issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const issueNumber = issue.number;
+            const today = new Date().toISOString().split('T')[0];
+            const labels = issue.labels.map(l => l.name);
+
+            // Remove backlog/review labels — bypass directly to sprint
+            const toRemove = ['status/review', 'status/backlog', 'status/triage'];
+            for (const label of toRemove) {
+              if (labels.includes(label)) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    name: label
+                  });
+                } catch (e) {
+                  core.info(`Label ${label} not present`);
+                }
+              }
+            }
+
+            // Apply sprint label if not already there
+            if (!labels.includes('status/sprint') && !labels.includes('status/in-progress')) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['status/sprint']
+              });
+            }
+
+            // Read CODEOWNERS to find pod owner for vertical
+            let podOwner = null;
+            try {
+              const { data: file } = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: '.github/CODEOWNERS'
+              });
+              const content = Buffer.from(file.content, 'base64').toString('utf-8');
+              const body = issue.body || '';
+              const verticalMatch = body.match(/###\s*Vertical\s*\n+([\s\S]+?)(?=\n###|$)/);
+              const vertical = verticalMatch ? verticalMatch[1].trim() : null;
+              const vertPathMap = {
+                'Datadog': 'datadog',
+                'Artifactory': 'artifactory',
+                'GitHub Platform': 'github-platform',
+                'JIRA & Wiki': 'jira-wiki',
+                'TFE': 'tfe',
+                'GitLab Pipelines': 'gitlab-pipelines'
+              };
+              if (vertical && vertPathMap[vertical]) {
+                const regex = new RegExp(`\\.github/verticals/${vertPathMap[vertical]}/\\s+(@[\\w-]+)`);
+                const match = content.match(regex);
+                podOwner = match ? match[1] : null;
+              }
+            } catch (e) {
+              core.warning('Could not read CODEOWNERS for pod owner lookup');
+            }
+
+            // Find team lead from CODEOWNERS *
+            let teamLead = null;
+            try {
+              const { data: file } = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: '.github/CODEOWNERS'
+              });
+              const content = Buffer.from(file.content, 'base64').toString('utf-8');
+              const match = content.match(/^\*\s+(@[\w-]+)/m);
+              teamLead = match ? match[1] : null;
+            } catch (e) {
+              core.info('Could not find team lead in CODEOWNERS');
+            }
+
+            const mentions = [podOwner, teamLead]
+              .filter(Boolean)
+              .filter((v, i, a) => a.indexOf(v) === i)
+              .join(' ');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: [
+                '## 🚨 Critical Issue — Fast Lane Activated',
+                '',
+                `${mentions}`,
+                '',
+                '| Field | Value |',
+                '|-------|-------|',
+                `| **Priority** | Critical |`,
+                `| **Fast lane** | Bypassed backlog — moved directly to sprint |`,
+                `| **SLA** | 1 calendar day from issue creation |`,
+                `| **SLA start** | ${today} (clock started now) |`,
+                `| **Response expected** | Within 30 minutes |`,
+                '',
+                '### Required actions',
+                '1. Pod owner — acknowledge this issue within 30 minutes',
+                '2. Post `/start` to begin work immediately',
+                '3. Update every 30 minutes until resolved',
+                '4. Post `/validate` when complete — do not wait for end of sprint',
+                '',
+                '> ⏱️ **SLA clock is running.** This issue will be flagged',
+                '> `status/overdue` by tomorrow\'s digest if not resolved.',
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });
+
+            core.info(`Critical fast lane activated for #${issueNumber}`);
+
+  critical-timeline-update:
+    name: Post Critical Timeline Update
+    needs: lint
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      startsWith(github.event.comment.body, '/update') &&
+      contains(github.event.issue.labels.*.name, 'priority/critical') &&
+      contains(github.event.issue.labels.*.name, 'status/in-progress')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record timeline update
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body;
+            const update = comment.replace('/update', '').trim();
+            const now = new Date().toISOString().replace('T', ' ').substring(0, 16) + ' UTC';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                `## 🕐 Critical Timeline Update — ${now}`,
+                '',
+                `**@${context.actor}:** ${update || 'Status update posted'}`,
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });

@@ -1,0 +1,490 @@
+name: Sprint Ceremonies
+
+on:
+  # Sprint planning — Monday of Week 1 at 8am UTC
+  schedule:
+    - cron: "0 8 * * 1"
+  # Mid-sprint check — Wednesday of Week 1 at 8am UTC
+  # (handled by conditional logic on which week of the sprint we are in)
+  workflow_dispatch:
+    inputs:
+      ceremony:
+        description: "Which ceremony to run"
+        required: true
+        type: choice
+        options:
+          - sprint-planning-reminder
+          - mid-sprint-check
+          - sprint-review
+          - sprint-retro-data
+      sprint_name:
+        description: "Sprint name (e.g. Sprint 6)"
+        required: false
+        default: ""
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: sprint-ceremonies
+  cancel-in-progress: false
+
+jobs:
+
+  lint:
+    name: Validate Workflow
+    uses: ./.github/workflows/yaml-lint.yml
+    with:
+      files: ".github/workflows/sprint-ceremonies.yml"
+
+  sprint-planning-reminder:
+    name: Sprint Planning Reminder
+    needs: lint
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.ceremony == 'sprint-planning-reminder'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post sprint planning reminder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sprintName = '${{ github.event.inputs.sprint_name }}' || 'Current Sprint';
+            const today = new Date().toISOString().split('T')[0];
+
+            // Fetch backlog items ranked by priority
+            const allIssues = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: 'status/backlog',
+                state: 'open',
+                per_page: 100
+              }
+            );
+
+            // Sort by priority
+            const priorityOrder = {
+              'priority/critical': 0,
+              'priority/high': 1,
+              'priority/medium': 2,
+              'priority/low': 3
+            };
+
+            const sorted = allIssues
+              .filter(i => !i.pull_request)
+              .sort((a, b) => {
+                const aP = a.labels.find(l => l.name.startsWith('priority/'));
+                const bP = b.labels.find(l => l.name.startsWith('priority/'));
+                const aOrder = aP ? (priorityOrder[aP.name] ?? 99) : 99;
+                const bOrder = bP ? (priorityOrder[bP.name] ?? 99) : 99;
+                return aOrder - bOrder;
+              });
+
+            // Group by vertical
+            const byVertical = {};
+            for (const issue of sorted) {
+              const vertical = issue.labels.find(l => l.name.startsWith('vertical/'));
+              const vertLabel = vertical ? vertical.name.replace('vertical/', '') : 'unassigned';
+              if (!byVertical[vertLabel]) byVertical[vertLabel] = [];
+              byVertical[vertLabel].push(issue);
+            }
+
+            // Build backlog table
+            const topItems = sorted.slice(0, 15);
+            const backlogRows = topItems.map(i => {
+              const priority = i.labels.find(l => l.name.startsWith('priority/'));
+              const vertical = i.labels.find(l => l.name.startsWith('vertical/'));
+              const days = Math.floor((Date.now() - new Date(i.created_at)) / (1000 * 60 * 60 * 24));
+              return `| #${i.number} | ${i.title.substring(0, 50)} | ${(priority?.name || 'none').replace('priority/', '')} | ${(vertical?.name || 'none').replace('vertical/', '')} | ${days} days old |`;
+            }).join('\n');
+
+            // Find or create the standup pinned issue for planning notes
+            const standupIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'standup-digest',
+              state: 'open',
+              per_page: 1
+            });
+
+            let targetIssueNumber;
+            if (standupIssues.data.length > 0) {
+              targetIssueNumber = standupIssues.data[0].number;
+            } else {
+              const { data: newIssue } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'CI/CD Team Daily Standup Digest',
+                body: 'Pinned standup and sprint digest issue. Managed automatically.',
+                labels: ['standup-digest']
+              });
+              targetIssueNumber = newIssue.number;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: targetIssueNumber,
+              body: [
+                `## 📅 Sprint Planning Reminder — ${sprintName} — ${today}`,
+                '',
+                '**Pod owners:** please nominate your vertical\'s items for this sprint by EOD today.',
+                'Apply `status/sprint` to items you are committing to. Team lead confirms the final list.',
+                '',
+                `### Backlog — Top ${topItems.length} items by priority`,
+                '',
+                '| # | Title | Priority | Vertical | Age |',
+                '|---|-------|----------|----------|-----|',
+                backlogRows || '*(backlog is empty)*',
+                '',
+                `### Backlog depth by vertical`,
+                '',
+                Object.entries(byVertical).map(([v, items]) =>
+                  `- **${v}**: ${items.length} item(s)`
+                ).join('\n') || '*(no backlog items)*',
+                '',
+                '### Sprint planning checklist',
+                '- [ ] Each pod owner has reviewed their vertical\'s backlog',
+                '- [ ] Nominated items have `status/sprint` applied',
+                '- [ ] Assignees confirmed for all sprint items',
+                '- [ ] No developer has more than capacity allows',
+                '- [ ] Critical items fast-tracked if any exist',
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });
+
+            core.info(`Sprint planning reminder posted for ${sprintName}`);
+
+  mid-sprint-check:
+    name: Mid-Sprint Check
+    needs: lint
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.ceremony == 'mid-sprint-check'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run mid-sprint health check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const today = new Date().toISOString().split('T')[0];
+
+            const allIssues = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100
+              }
+            );
+
+            const issues = allIssues.filter(i => !i.pull_request);
+
+            const sprintItems = issues.filter(i =>
+              i.labels.some(l => ['status/sprint', 'status/in-progress', 'status/blocked', 'status/validation'].includes(l.name))
+            );
+            const inProgress = issues.filter(i => i.labels.some(l => l.name === 'status/in-progress'));
+            const blocked = issues.filter(i => i.labels.some(l => l.name === 'status/blocked'));
+            const overdue = issues.filter(i => i.labels.some(l => l.name === 'status/overdue'));
+            const validation = issues.filter(i => i.labels.some(l => l.name === 'status/validation'));
+            const sprintReady = issues.filter(i => i.labels.some(l => l.name === 'status/sprint'));
+
+            const blockedPct = sprintItems.length > 0
+              ? Math.round((blocked.length / sprintItems.length) * 100)
+              : 0;
+
+            const health = blockedPct > 20 || overdue.length > 2
+              ? '🔴 At Risk'
+              : blockedPct > 10 || overdue.length > 0
+              ? '🟡 Caution'
+              : '🟢 On Track';
+
+            const standupIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'standup-digest',
+              state: 'open',
+              per_page: 1
+            });
+
+            const targetIssue = standupIssues.data[0];
+            if (!targetIssue) {
+              core.info('No standup issue found — skipping mid-sprint post');
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: targetIssue.number,
+              body: [
+                `## 🔄 Mid-Sprint Check — ${today}`,
+                '',
+                `**Overall health: ${health}**`,
+                '',
+                '| Metric | Count | Target |',
+                '|--------|-------|--------|',
+                `| Sprint committed | ${sprintItems.length} | — |`,
+                `| Ready (not started) | ${sprintReady.length} | Should be 0 by now |`,
+                `| In progress | ${inProgress.length} | Active work |`,
+                `| Blocked | ${blocked.length} | ${blockedPct}% of sprint — target <15% |`,
+                `| Awaiting validation | ${validation.length} | — |`,
+                `| SLA breached | ${overdue.length} | Target 0 |`,
+                '',
+                blocked.length > 0 ? [
+                  '### ⚠️ Blocked items requiring attention',
+                  blocked.map(i => {
+                    // updated_at used as display approximation — not SLA truth
+                    // Accurate blocked duration is in lifecycle-timestamps.js but
+                    // mid-sprint check only needs approximate counts for the digest
+                    const days = Math.floor((Date.now() - new Date(i.updated_at)) / (1000 * 60 * 60 * 24));
+                    return `- #${i.number} — ${i.title.substring(0, 60)} (~${days} days blocked)`;
+                  }).join('\n')
+                ].join('\n') : '',
+                '',
+                sprintReady.length > 0
+                  ? `> ⚠️ ${sprintReady.length} sprint item(s) not yet started — consider reassigning if capacity is the issue.`
+                  : '',
+                '',
+                '**No new items should be pulled into the sprint unless they are Critical priority.**',
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].filter(l => l !== '').join('\n')
+            });
+
+  sprint-review:
+    name: Sprint Review Data
+    needs: lint
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.ceremony == 'sprint-review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate sprint review summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sprintName = '${{ github.event.inputs.sprint_name }}' || 'Current Sprint';
+            const today = new Date().toISOString().split('T')[0];
+            const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+
+            // Fetch issues closed in the last 14 days
+            const closedIssues = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'closed',
+                since: twoWeeksAgo,
+                per_page: 100
+              }
+            );
+
+            const delivered = closedIssues.filter(i => {
+              if (i.pull_request) return false;
+              const labels = i.labels.map(l => l.name);
+              return labels.includes('status/done') || labels.includes('type/task') || labels.includes('type/bug');
+            });
+
+            // Group by vertical
+            const byVertical = {};
+            for (const issue of delivered) {
+              const vertical = issue.labels.find(l => l.name.startsWith('vertical/'));
+              const vert = vertical ? vertical.name.replace('vertical/', '') : 'unassigned';
+              if (!byVertical[vert]) byVertical[vert] = [];
+              byVertical[vert].push(issue);
+            }
+
+            // Build delivery table
+            const deliveryRows = delivered.map(i => {
+              const vertical = i.labels.find(l => l.name.startsWith('vertical/'));
+              const priority = i.labels.find(l => l.name.startsWith('priority/'));
+              const body = i.body || '';
+              const outcomeMatch = body.match(/###\s*Expected Outcome\s*\n+([\s\S]+?)(?=\n###|$)/);
+              const outcome = outcomeMatch ? outcomeMatch[1].trim().substring(0, 60) : 'Not specified';
+              return `| #${i.number} | ${i.title.substring(0, 45)} | ${(vertical?.name || '').replace('vertical/', '')} | ${(priority?.name || '').replace('priority/', '')} | ${outcome} |`;
+            }).join('\n');
+
+            const standupIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'standup-digest',
+              state: 'open',
+              per_page: 1
+            });
+
+            const targetIssue = standupIssues.data[0];
+            if (!targetIssue) return;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: targetIssue.number,
+              body: [
+                `## 🎉 Sprint Review — ${sprintName} — ${today}`,
+                '',
+                `**Delivered this sprint: ${delivered.length} items**`,
+                '',
+                '| # | Title | Vertical | Priority | Expected Outcome |',
+                '|---|-------|----------|----------|------------------|',
+                deliveryRows || '*(nothing delivered this sprint)*',
+                '',
+                '### Delivery by vertical',
+                Object.entries(byVertical).map(([v, items]) =>
+                  `- **${v}**: ${items.length} item(s) delivered`
+                ).join('\n') || '*(none)*',
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].join('\n')
+            });
+
+  sprint-retro-data:
+    name: Sprint Retro Data
+    needs: lint
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.ceremony == 'sprint-retro-data'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate retrospective data
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sprintName = '${{ github.event.inputs.sprint_name }}' || 'Current Sprint';
+            const today = new Date().toISOString().split('T')[0];
+            const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+
+            // Closed issues this sprint
+            const closed = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'closed',
+                since: twoWeeksAgo.toISOString(),
+                per_page: 100
+              }
+            );
+
+            const delivered = closed.filter(i => !i.pull_request);
+
+            // All issues updated this sprint
+            const allIssues = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'all',
+                since: twoWeeksAgo.toISOString(),
+                per_page: 100
+              }
+            );
+
+            const sprintIssues = allIssues.filter(i => !i.pull_request);
+
+            // Blocked issues this sprint
+            const wasBlocked = sprintIssues.filter(i =>
+              i.labels.some(l => l.name === 'status/blocked') ||
+              (i.body || '').includes('/block')
+            );
+
+            // Overdue issues
+            const wasOverdue = sprintIssues.filter(i =>
+              i.labels.some(l => l.name === 'status/overdue')
+            );
+
+            // SLA met calculation
+            const slaMet = delivered.filter(i => !i.labels.some(l => l.name === 'status/overdue')).length;
+            const slaPct = delivered.length > 0 ? Math.round((slaMet / delivered.length) * 100) : 100;
+
+            // Cycle time approximation (created to closed)
+            const cycleTimes = delivered
+              .filter(i => i.closed_at && i.created_at)
+              .map(i => Math.floor((new Date(i.closed_at) - new Date(i.created_at)) / (1000 * 60 * 60 * 24)));
+
+            const avgCycleTime = cycleTimes.length > 0
+              ? Math.round(cycleTimes.reduce((a, b) => a + b, 0) / cycleTimes.length)
+              : 0;
+
+            // Blocker root causes from comments
+            const blockerReasons = [];
+            for (const issue of wasBlocked.slice(0, 5)) {
+              try {
+                const { data: comments } = await github.rest.issues.listComments({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  per_page: 20
+                });
+                const blockComment = comments.find(c => c.body.startsWith('/block'));
+                if (blockComment) {
+                  const reason = blockComment.body.replace('/block', '').trim().substring(0, 80);
+                  blockerReasons.push(`- #${issue.number}: ${reason}`);
+                }
+              } catch (e) {
+                core.info(`Could not fetch comments for #${issue.number}`);
+              }
+            }
+
+            const standupIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'standup-digest',
+              state: 'open',
+              per_page: 1
+            });
+
+            const targetIssue = standupIssues.data[0];
+            if (!targetIssue) return;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: targetIssue.number,
+              body: [
+                `## 🔍 Sprint Retrospective Data — ${sprintName} — ${today}`,
+                '',
+                '> Use this data to ground the retro conversation in facts, not feelings.',
+                '',
+                '### Velocity',
+                `| Metric | Value |`,
+                `|--------|-------|`,
+                `| Items delivered | ${delivered.length} |`,
+                `| Avg cycle time | ${avgCycleTime} days (created → closed) |`,
+                `| SLA met | ${slaMet}/${delivered.length} (${slaPct}%) |`,
+                '',
+                '### What slowed us down',
+                `| Metric | Value |`,
+                `|--------|-------|`,
+                `| Issues that hit status/blocked | ${wasBlocked.length} |`,
+                `| Issues that hit status/overdue | ${wasOverdue.length} |`,
+                '',
+                blockerReasons.length > 0 ? [
+                  '**Blocker summaries:**',
+                  blockerReasons.join('\n')
+                ].join('\n') : '',
+                '',
+                '### Retro questions',
+                '',
+                '**1. What slowed us down?**',
+                wasBlocked.length > 0
+                  ? `${wasBlocked.length} item(s) were blocked this sprint. What was the root cause? Is it a recurring pattern?`
+                  : 'No blockers this sprint. What made execution smooth?',
+                '',
+                '**2. What went well?**',
+                `${delivered.length} item(s) delivered. ${slaPct}% met SLA. Discuss what contributed to those results.`,
+                '',
+                '**3. What do we change?**',
+                'Agree 1-2 specific process changes. Each change becomes a real task in the board — not a note.',
+                '',
+                '> **Reminder:** Any agreed change must become a task linked to the Continuous Improvement Epic.',
+                '',
+                '---',
+                '*Automated by CI/CD IssueOps | ci-cd-team*'
+              ].filter(l => l !== '').join('\n')
+            });
+
+            core.info(`Retro data posted for ${sprintName}`);
